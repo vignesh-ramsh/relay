@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.util
+import inspect
 import sys
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -214,18 +215,35 @@ HookFn = Callable[[HookContext], Awaitable[None]]
 class WhitelistedFunction:
     """One @arc.relay.whitelist()-decorated function — always callable
     directly via arc.relay.call(name, **kwargs); additionally routed
-    through Gateway (if installed) at `path`. Minimal RBAC for this cut
-    (see whitelist() below): with no authn installed, every caller
-    resolves to role "Guest" and nothing else — a real role is a hard
-    boot-time error, matching §3.3's existing rule for the same situation
-    everywhere else in ARC. Full RBAC (real role resolution once authn
-    exists) is still a separate, later increment."""
+    through Gateway (if installed) at `path`. RBAC (_wire_gateway_route
+    below): with no authn installed, every caller resolves to role "Guest"
+    and nothing else — a real role, or "*" (any resolved identity,
+    role-agnostic), is a hard boot-time error without authn installed,
+    matching §3.3's rule for the same situation everywhere else in ARC.
+    With authn installed, a caller's real roles (from request.identity) are
+    checked against `roles`.
+    wants_identity: computed once at decoration time (whitelist() below) by
+    inspecting fn's own signature — true if it declares an `identity`
+    parameter. Lets a function that needs to know its caller (e.g.
+    authn.create_access_key) opt in just by naming the parameter, without
+    every other whitelisted function (arc.relay.call() from the CLI, a
+    hook, example_hr's Guest-only functions) needing to know or care.
+    wants_client_ip: the same mechanism, mirrored, for a function that
+    declares a `client_ip` parameter — e.g. authn.login()'s per-(ip,email)
+    rate limiting, which has no other way to see the caller's resolved,
+    proxy-aware IP (gateway.middleware.client_ip_middleware) short of this."""
     name: str            # "<plugin>.<function_name>" — also arc.relay.call()'s key
     plugin: str
     fn: Callable[..., Awaitable[Any]]
     methods: list[str]
     roles: list[str]
     path: str
+    wants_identity: bool = False
+    wants_client_ip: bool = False
+    signature: Any = None  # inspect.Signature, computed once at decoration time —
+                            # _wire_gateway_route uses signature.bind() to reject a
+                            # malformed body as a 400 before ever calling fn, rather
+                            # than recomputing inspect.signature(fn) per request
 
 
 # The ambient "current write's connection" — set only for the duration of a
@@ -279,7 +297,13 @@ class RelayProvider:
             return
         plugin = self._kernel.current_plugin() or "<direct>"
         for path in sorted(hooks_dir.glob("*.py")):
-            table = slugify_table_name(path.stem)
+            # system=True only preserves a leading "_" when the filename itself
+            # has one (psqldb.model.slugify_table_name) — safe unconditionally,
+            # a non-underscore filename like "Employee.py" is unaffected. Without
+            # this, a hook file for a "system": true table (e.g. "_users.py")
+            # would resolve to table key "users", never matching the real table
+            # "_users" — the hook would silently never fire.
+            table = slugify_table_name(path.stem, system=True)
             self._loading_table = table
             self._loading_plugin = plugin
             try:
@@ -940,6 +964,77 @@ class RelayProvider:
             finally:
                 self._loading_plugin = None
 
+    # ------------------------------------------------------------------ #
+    # Background/scheduled jobs — plugins/<plugin>/tasks/*.py, loaded via
+    # register_tasks(), same directory-loading pattern as hooks/api.
+    #
+    # This is the ONLY surface a business plugin should ever call for
+    # this — never `arc.lineup.task(...)`/`arc.lineup.register_tasks(...)`
+    # directly (docs/arc.MD §3.15). Same posture as cache_get/cache_set/
+    # lock() above: relay is the facade every plugin writes against,
+    # `lineup` (like `redix`) is an optional power source relay reaches
+    # for when installed, never a dependency a business plugin declares
+    # or thinks about itself. A plugin that only ever calls arc.relay.task/
+    # register_tasks/enqueue needs no `optional_requires=["lineup"]` of
+    # its own at all — the boot-order guarantee it'd otherwise need comes
+    # for free, transitively, through relay's OWN optional_requires on
+    # lineup (§3.1's resolver treats optional_requires as a real
+    # topological edge when both plugins are present; since every business
+    # plugin already hard-requires relay, and relay->lineup is such an
+    # edge whenever lineup is installed, lineup is guaranteed to boot
+    # before every plugin downstream of relay too — verified against a
+    # real `arc doctor` run after removing example_hr's own direct
+    # optional_requires=["lineup"]).
+    # ------------------------------------------------------------------ #
+    def register_tasks(self, tasks_dir: str | Path) -> None:
+        tasks_dir = Path(tasks_dir)
+        if not tasks_dir.exists():
+            return
+        plugin = self._kernel.current_plugin() or "<direct>"
+        for path in sorted(tasks_dir.glob("*.py")):
+            self._loading_plugin = plugin
+            try:
+                module_name = f"_arc_relay_tasks_{plugin}_{path.stem}"
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            finally:
+                self._loading_plugin = None
+
+    def task(
+        self, *, queue: str = "default", cron: str | None = None
+    ) -> Callable[[Callable[..., Awaitable[Any]]], Any]:
+        """`@arc.relay.task(queue="default")` — a durable, on-demand job
+        when `lineup` is installed (real Redis-backed dispatch, docs/
+        arc.MD §3.15); `@arc.relay.task(queue="default", cron="0 23 * * *")`
+        additionally schedules it, dispatched by `arc lineup scheduler`
+        at its real next occurrence, never at registration time.
+
+        With no `lineup` installed, this degrades to returning `fn`
+        completely unchanged — `arc.relay.enqueue(fn, ...)` already knows
+        how to run a plain function in-process (exactly as it always has,
+        docs/arc.MD §3.11), so the decorator itself never needs to wrap
+        anything in that case. A `cron=` that can't actually be honored
+        without a scheduler process running is surfaced once via
+        `kernel.advise()` (the same "advise, don't fail" posture as every
+        other optional-capability degradation in this project, §3.5)
+        rather than silently doing nothing with no signal at all."""
+
+        def decorator(fn: Callable[..., Awaitable[Any]]) -> Any:
+            if self._kernel.has("lineup"):
+                return self._kernel.get("lineup").task(queue=queue, cron=cron)(fn)
+            if cron is not None:
+                plugin = self._loading_plugin or self._kernel.current_plugin() or "<direct>"
+                self._kernel.advise(
+                    f"relay: task '{plugin}.{fn.__name__}' declared cron={cron!r} but no "
+                    f"'lineup' plugin is installed — it will never run automatically, only "
+                    f"via a manual arc.relay.enqueue({fn.__name__}, ...) call."
+                )
+            return fn
+
+        return decorator
+
     def whitelist(
         self, *, methods: list[str] | None = None, roles: list[str] | None = None, path: str | None = None
     ) -> Callable[[Callable], Callable]:
@@ -961,7 +1056,12 @@ class RelayProvider:
                 )
             name = f"{plugin}.{fn.__name__}"
             derived_path = path or f"/api/method/{name}"
-            wf = WhitelistedFunction(name=name, plugin=plugin, fn=fn, methods=methods, roles=roles, path=derived_path)
+            sig = inspect.signature(fn)
+            wf = WhitelistedFunction(
+                name=name, plugin=plugin, fn=fn, methods=methods, roles=roles, path=derived_path,
+                wants_identity="identity" in sig.parameters, wants_client_ip="client_ip" in sig.parameters,
+                signature=sig,
+            )
             if wf.name in self._whitelisted:
                 raise RuntimeError(f"whitelisted function '{wf.name}' is already registered.")
             self._whitelisted[wf.name] = wf
@@ -989,19 +1089,64 @@ class RelayProvider:
         from gateway.request import HTTPError  # only imported when gateway is actually present
 
         async def handler(request: Any) -> Any:
-            # Minimal RBAC for this cut (see WhitelistedFunction docstring):
-            # with no authn installed, every request resolves to role
-            # "Guest" and nothing else — unresolved identity defaults to
-            # Guest by design, and a real role can't exist without authn
-            # (already refused at registration time above).
-            if "Guest" not in wf.roles:
+            # request.identity is None whenever authn isn't installed, or a
+            # request carries no valid credentials — both collapse to
+            # caller_roles = {"Guest"}, identical to this cut's old
+            # Guest-only behavior, so roles=["Guest"] endpoints (e.g.
+            # example_hr's) are unaffected either way. "*" means "any
+            # resolved identity, role-agnostic" — declaring it with no authn
+            # installed is already refused at registration time above (only
+            # "Guest" can ever be granted without one), so by the time this
+            # runs, "*" here always means authn IS installed.
+            identity = getattr(request, "identity", None)
+            caller_roles = set(getattr(identity, "roles", None) or [])
+            if "*" in wf.roles:
+                authorized = identity is not None
+            elif "*" in caller_roles:
+                # The same "*" sentinel, meaning the same thing symmetrically
+                # on the CALLER's side instead of the endpoint's: a caller
+                # whose own roles include the wildcard satisfies any specific
+                # role requirement, not just an endpoint that opted into
+                # roles=["*"]. Relay itself has no idea what grants this —
+                # it's authn's own convention (a "Superuser" role causing
+                # resolve_identity to inject "*") to decide who qualifies;
+                # relay only needs to know the one sentinel already has this
+                # meaning on the other side of the same check.
+                authorized = True
+            else:
+                authorized = bool((caller_roles | {"Guest"}) & set(wf.roles))
+            if not authorized:
                 raise HTTPError(403, {"error": "forbidden", "detail": f"requires role(s) {wf.roles}"})
             try:
                 body = request.json() if request.body else {}
             except Exception as exc:
                 raise HTTPError(422, {"error": "invalid JSON body", "detail": str(exc)}) from exc
+            # A JSON body that decodes to a list/string/number/etc. isn't
+            # spreadable as **kwargs at all — reject it as a client mistake
+            # (422) here, rather than letting it become a bare TypeError
+            # below that would otherwise escape as an unstructured 500.
+            if not isinstance(body, dict):
+                raise HTTPError(422, {"error": "JSON body must be an object", "detail": type(body).__name__})
+            kwargs = dict(body)
+            if wf.wants_identity:
+                # Always the server-resolved identity, never a client-supplied
+                # "identity" key in the body — this overwrites it deliberately.
+                kwargs["identity"] = identity
+            if wf.wants_client_ip:
+                kwargs["client_ip"] = getattr(request, "client_ip", None)
             try:
-                return await wf.fn(**body)
+                # Bind (never call) against the real signature first — this
+                # is where a body with missing/unexpected/mistyped keys
+                # surfaces as TypeError, entirely separate from actually
+                # invoking wf.fn. Doing it this way means a TypeError raised
+                # from INSIDE wf.fn's own body (a genuine bug) is never
+                # mistaken for a client mistake here — only this bind() call
+                # can produce this specific 400, the real call below cannot.
+                wf.signature.bind(**kwargs)
+            except TypeError as exc:
+                raise HTTPError(400, {"error": "invalid arguments", "detail": str(exc)}) from exc
+            try:
+                return await wf.fn(**kwargs)
             except RelayError as exc:
                 raise HTTPError(exc.status, {"error": exc.message, "code": exc.code}) from exc
 
@@ -1058,13 +1203,64 @@ class RelayProvider:
         async with lock:
             yield
 
-    def enqueue(self, fn: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> asyncio.Task:
-        """NOT durable regardless of whether redix is installed — unlike
-        cache/lock, this doesn't actually upgrade when redix is present,
-        because TaskIQ (the real queue backend named in the tech stack)
-        isn't integrated yet. This is always in-process fire-and-forget for
-        now: lost on crash/restart, no retry, no persistence. Said plainly
-        here rather than dressed up to look more capable than it is."""
+    def enqueue(
+        self, fn: Callable[..., Awaitable[Any]], *args: Any, queue: str = "default", **kwargs: Any
+    ) -> asyncio.Task:
+        """The one entry point for background work — declared ahead of
+        time (`@arc.relay.task(...)`, a plugins/<plugin>/tasks/*.py file)
+        or completely ad hoc (any plain function, called from literally
+        anywhere: a whitelisted function, a hook, wherever). Docs/arc.MD
+        §3.15 — this is deliberately the ONLY surface a business plugin
+        should ever call for this; never `arc.lineup.*` directly.
+
+        Three paths, in order:
+        1. `fn` is already a `@arc.relay.task(...)`-declared task
+           (`arc.lineup.is_task(fn)`) — dispatched via its own `.kiq()`,
+           on whatever queue it was declared with (`queue=` here is
+           ignored in this path; the task's own declared queue wins).
+        2. `lineup` is installed and `fn` is a plain, resolvable function
+           (checked synchronously, immediately, via
+           `arc.lineup.check_resolvable` — raises TypeError right here at
+           the call site if `fn` is a lambda, a closure, or otherwise
+           can't be re-imported by a worker process later) — dispatched
+           via `arc.lineup.enqueue_by_path(fn, queue=queue, ...)`, no
+           decorator or tasks/ file required at all.
+        3. No `lineup` installed — the original in-process
+           `asyncio.create_task()` fallback: lost on crash/restart, no
+           retry, no persistence, same as always (`queue=` has no meaning
+           here, there's no queue concept without lineup).
+
+        The two durable paths (1, 2) and the fallback (3) have a real
+        semantic difference, not just an implementation swap: in the
+        fallback, the returned Task completing means `fn` actually
+        finished running, in THIS process. In a durable path, it means
+        the job was successfully handed off to Redis — actual execution
+        happens later, in a separate `arc lineup worker` process, and this
+        Task's own success/failure says nothing about whether that later
+        execution succeeds (there's no result backend wired up to report
+        that back yet, docs/arc.MD §8). Either way this stays fire-and-
+        forget from the caller's point of view — durable-fire-and-forget
+        instead of volatile-fire-and-forget."""
+        if self._kernel.has("lineup"):
+            lineup = self._kernel.get("lineup")
+            if lineup.is_task(fn):
+                coro = lineup.enqueue(fn, *args, **kwargs)
+            else:
+                lineup.check_resolvable(fn)  # raises TypeError here, synchronously, before any Task exists
+                coro = lineup.enqueue_by_path(fn, *args, queue=queue, **kwargs)
+
+            task = asyncio.create_task(coro)
+
+            def _on_enqueue_done(t: asyncio.Task) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    self.log(f"lineup enqueue for task {fn.__name__} failed: {exc}", level="error")
+
+            task.add_done_callback(_on_enqueue_done)
+            return task
+
         task = asyncio.create_task(fn(*args, **kwargs))
 
         def _on_done(t: asyncio.Task) -> None:
