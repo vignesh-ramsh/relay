@@ -44,6 +44,7 @@ import inspect
 import sys
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
@@ -1261,7 +1262,41 @@ class RelayProvider:
             task.add_done_callback(_on_enqueue_done)
             return task
 
-        task = asyncio.create_task(fn(*args, **kwargs))
+        started_at = datetime.now(timezone.utc)
+
+        async def _run_and_log() -> Any:
+            status, error = "success", None
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                status, error = "failed", f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                # Best-effort — a DB hiccup writing the log row must never
+                # mask or replace the real task's own outcome above.
+                finished_at = datetime.now(timezone.utc)
+                try:
+                    await arc.psqldb.insert(
+                        "_job_log",
+                        {
+                            "task_name": getattr(fn, "__qualname__", None)
+                            or getattr(fn, "__name__", None)
+                            or repr(fn),
+                            "queue": queue,
+                            "executor": "relay",
+                            "job_type": "Task",  # the in-process fallback has no scheduling concept at all
+                            "queued_by": (getattr(fn, "__module__", "") or "").split(".")[0] or None,
+                            "status": status,
+                            "error": error,
+                            "started_at": started_at,
+                            "finished_at": finished_at,
+                            "duration_ms": int((finished_at - started_at).total_seconds() * 1000),
+                        },
+                    )
+                except Exception as log_exc:
+                    self.log(f"failed to write _job_log row for {fn.__name__}: {log_exc}", level="error")
+
+        task = asyncio.create_task(_run_and_log())
 
         def _on_done(t: asyncio.Task) -> None:
             if t.cancelled():
@@ -1293,7 +1328,7 @@ class RelayProvider:
             "hooks_registered": hook_count,
             "whitelisted_functions": len(self._whitelisted),
             "cache_lock_backend": "redix" if self._redix is not None else "in-process fallback",
-            "queue_backend": "in-process (TaskIQ not integrated yet)",
+            "queue_backend": "lineup (TaskIQ + Redis)" if self._kernel.has("lineup") else "in-process fallback",
         }
 
 
@@ -1308,4 +1343,23 @@ def register(kernel: Any) -> None:
             "guarantees. (arc.relay.enqueue() is unaffected by this — it's in-process "
             "fire-and-forget either way; see its own docstring for why.)"
         )
-    kernel.export(CAPABILITY, provider, requires=["psqldb"], optional_requires=["authn", "redix", "gateway"])
+
+    # relay's own operational table (§3.15) — logs every job it directly
+    # ran itself (the in-process enqueue() fallback, see enqueue() above);
+    # lineup writes into this same table too, from its own worker/scheduler
+    # processes, for everything IT runs. relay owns the schema since it's
+    # the common denominator: every project using lineup also has relay,
+    # not the reverse.
+    kernel.get("psqldb").register_model(Path(__file__).parent / "schemas")
+
+    kernel.export(
+        CAPABILITY, provider, requires=["psqldb"], optional_requires=["authn", "redix", "gateway", "lineup"]
+    )
+
+    # relay's own maintenance job, registered on itself via the exact
+    # facade every other plugin uses (docs/arc.MD §3.11) — not loaded via
+    # register_tasks()'s directory convention (see _maintenance.py's own
+    # docstring for why that's unnecessary here).
+    from relay._maintenance import prune_job_log
+
+    provider.task(queue="default", cron="0 2 * * *")(prune_job_log)
