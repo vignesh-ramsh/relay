@@ -1162,15 +1162,28 @@ class RelayProvider:
     # backing the cache — the local fallback stores Python objects as-is,
     # same process, no serialization boundary to cross.
     # ------------------------------------------------------------------ #
+    # Every key this cache ever touches gets a stable "cache:" prefix,
+    # transparently — callers still just pass their own logical key name.
+    # This exists purely so `arc clear-cache` (the kernel's own CLI) can
+    # find and delete exactly these entries without also catching
+    # authn's session/access-key cache (its own "session:"/"access_key:"
+    # prefixes), lineup's job queues ("lineup:<queue>"), or redix's rate
+    # limit counters ("ratelimit:<key>") — all sharing the same Redis
+    # instance. Verified safe to add: nothing in this codebase calls
+    # cache_get/cache_set/cache_delete today, so there's no existing raw
+    # key name anywhere that this would silently stop matching.
+    def _cache_key(self, key: str) -> str:
+        return f"cache:{key}"
+
     async def cache_get(self, key: str) -> Any:
         if self._redix is not None:
-            raw = await self._redix.get(key)
+            raw = await self._redix.get(self._cache_key(key))
             return arc.codec.decode(raw) if raw is not None else None
         return self._local_cache.get(key)
 
     async def cache_set(self, key: str, value: Any, *, ex: int | None = None) -> None:
         if self._redix is not None:
-            await self._redix.set(key, arc.codec.encode(value), ex=ex)
+            await self._redix.set(self._cache_key(key), arc.codec.encode(value), ex=ex)
             return
         self._local_cache[key] = value
         if ex is not None:
@@ -1181,7 +1194,7 @@ class RelayProvider:
 
     async def cache_delete(self, key: str) -> None:
         if self._redix is not None:
-            await self._redix.delete(key)
+            await self._redix.delete(self._cache_key(key))
             return
         self._local_cache.pop(key, None)
 
