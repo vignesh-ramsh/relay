@@ -59,6 +59,14 @@ from . import query
 
 CAPABILITY = "relay"
 
+# The concrete verb set a whitelisted function registers when `methods` is
+# left unspecified (docs: methods is a RESTRICTION when given, not a
+# required allowlist — the function body, plus dry_run below, decides the
+# actual behavior, RPC-style). OPTIONS is deliberately excluded — CORS
+# preflight is already handled entirely by cors_middleware upstream of
+# routing, so a whitelisted route never needs to own that verb itself.
+ALL_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+
 HookEvent = Literal[
     "validate", "before_save", "after_save",
     "before_delete", "after_delete",
@@ -242,6 +250,16 @@ class WhitelistedFunction:
     path: str
     wants_identity: bool = False
     wants_client_ip: bool = False
+    wants_dry_run: bool = False  # same mechanism, mirrored, for a function that
+                                  # declares a `dry_run` parameter — True whenever
+                                  # the inbound request used a safe/idempotent verb
+                                  # (today: GET) against a write-capable endpoint.
+                                  # Purely informational for the function's OWN
+                                  # non-relay side effects (mail, enqueue, ...) —
+                                  # the REAL enforcement for arc.relay.save/delete
+                                  # is the _dry_run contextvar below, active
+                                  # regardless of whether the function asked for
+                                  # this kwarg at all.
     signature: Any = None  # inspect.Signature, computed once at decoration time —
                             # _wire_gateway_route uses signature.bind() to reject a
                             # malformed body as a 400 before ever calling fn, rather
@@ -256,6 +274,28 @@ class WhitelistedFunction:
 # nesting (a hook calling arc.relay.create(), whose OWN hooks call something
 # else again, ...) with no extra plumbing per level.
 _active_conn: ContextVar[Any | None] = ContextVar("arc_relay_active_conn", default=None)
+
+# Set for the duration of a GET-triggered whitelisted call (_wire_gateway_route,
+# below) — read by every write primitive to decide whether its own
+# conn.transaction() should actually commit. Same task-scoped-and-inherited
+# contextvar property as _active_conn: a hook's own nested arc.relay.save()
+# call correctly inherits the outer request's dry-run status with no extra
+# plumbing. Scoped to arc.relay.save/save_many/delete/delete_many ONLY — it
+# cannot and does not make safe anything else a whitelisted function does
+# (arc.mail.send(), arc.relay.enqueue(), a raw arc.relay.sql() write, an
+# external HTTP call, admin's own DDL-applying endpoints) — those remain the
+# function author's own responsibility to guard, via the `dry_run` kwarg
+# injection (WhitelistedFunction.wants_dry_run) if they choose to.
+_dry_run: ContextVar[bool] = ContextVar("arc_relay_dry_run", default=False)
+
+
+class _DryRunRollback(Exception):
+    """Internal sentinel only — never escapes _transaction_or_dry_run, never
+    seen by a caller or a hook. Forces asyncpg's conn.transaction() to roll
+    back (any exception raised inside its `async with` block does) without
+    being treated as a genuine failure: on_rollback must never fire for a
+    dry run (nothing failed, it was never meant to persist), and neither
+    should after_commit (nothing was actually committed either)."""
 
 
 class RelayProvider:
@@ -435,6 +475,26 @@ class RelayProvider:
             finally:
                 _active_conn.reset(token)
 
+    @contextlib.asynccontextmanager
+    async def _transaction_or_dry_run(self, conn: Any, dry_run: bool):
+        """Drop-in replacement for `async with conn.transaction():` in every
+        write primitive below. Runs the caller's body (hooks + the real
+        INSERT/UPDATE/DELETE, via `RETURNING *` so ctx.new reflects real
+        server-computed defaults/triggers) exactly as normal; if `dry_run`,
+        raises a sentinel right after the body completes — still INSIDE
+        conn.transaction()'s own `async with`, so asyncpg rolls back for
+        real — then swallows it here so the caller sees a normal return,
+        never an exception. The caller is responsible for skipping
+        after_commit when dry_run is true (on_rollback is never fired here
+        either way, since _DryRunRollback isn't a real failure)."""
+        try:
+            async with conn.transaction():
+                yield
+                if dry_run:
+                    raise _DryRunRollback()
+        except _DryRunRollback:
+            pass
+
     # ------------------------------------------------------------------ #
     # CRUD — single-row. Every write runs inside ONE transaction spanning
     # precommit hooks + the actual psqldb write; postcommit hooks run
@@ -453,9 +513,10 @@ class RelayProvider:
         self._psqldb.schema(table)  # SchemaError early if unknown, before opening anything
         ctx = HookContext(table=table, old=None, payload=dict(data))
         ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
+        dry_run = _dry_run.get()
         async with self._write_transaction(new_transaction=new_transaction) as conn:
             try:
-                async with conn.transaction():
+                async with self._transaction_or_dry_run(conn, dry_run):
                     ctx.conn = conn
                     await self._run_hooks(table, "validate", ctx)
                     await self._run_hooks(table, "before_save", ctx)
@@ -469,7 +530,8 @@ class RelayProvider:
                 await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             ctx.conn = None
-        await self._run_hooks_resolved(table, "after_commit", ctx)
+        if not dry_run:
+            await self._run_hooks_resolved(table, "after_commit", ctx)
         return ctx.new
 
     async def _update(
@@ -477,9 +539,10 @@ class RelayProvider:
     ) -> dict | None:
         self._psqldb.schema(table)
         ctx = HookContext(table=table, payload=dict(data))
+        dry_run = _dry_run.get()
         async with self._write_transaction(new_transaction=new_transaction) as conn:
             try:
-                async with conn.transaction():
+                async with self._transaction_or_dry_run(conn, dry_run):
                     ctx.conn = conn
                     if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
                         old_row = await self._psqldb.get(table, id, conn=conn)
@@ -497,7 +560,8 @@ class RelayProvider:
                 await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             ctx.conn = None
-        await self._run_hooks_resolved(table, "after_commit", ctx)
+        if not dry_run:
+            await self._run_hooks_resolved(table, "after_commit", ctx)
         return ctx.new
 
     async def save(
@@ -575,9 +639,10 @@ class RelayProvider:
     async def delete(self, table: str, id: UUID, *, by: str | None = None, new_transaction: bool = False) -> None:
         self._psqldb.schema(table)
         ctx = HookContext(table=table)
+        dry_run = _dry_run.get()
         async with self._write_transaction(new_transaction=new_transaction) as conn:
             try:
-                async with conn.transaction():
+                async with self._transaction_or_dry_run(conn, dry_run):
                     ctx.conn = conn
                     if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
                         old_row = await self._psqldb.get(table, id, conn=conn)
@@ -592,7 +657,8 @@ class RelayProvider:
                 await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             ctx.conn = None
-        await self._run_hooks_resolved(table, "after_commit", ctx)
+        if not dry_run:
+            await self._run_hooks_resolved(table, "after_commit", ctx)
 
     # ------------------------------------------------------------------ #
     # Query Engine (docs/arc.MD §3.4) — get/list/count/aggregate all funnel
@@ -770,9 +836,10 @@ class RelayProvider:
         ctxs = [HookContext(table=table, old=None, payload=dict(r)) for r in rows]
         for ctx in ctxs:
             ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
+        dry_run = _dry_run.get()
         async with self._write_transaction(new_transaction=new_transaction) as conn:
             try:
-                async with conn.transaction():
+                async with self._transaction_or_dry_run(conn, dry_run):
                     for ctx in ctxs:
                         ctx.conn = conn
                         await self._run_hooks(table, "validate", ctx)
@@ -793,8 +860,9 @@ class RelayProvider:
                 raise
             for ctx in ctxs:
                 ctx.conn = None
-        for ctx in ctxs:
-            await self._run_hooks_resolved(table, "after_commit", ctx)
+        if not dry_run:
+            for ctx in ctxs:
+                await self._run_hooks_resolved(table, "after_commit", ctx)
         return [ctx.new for ctx in ctxs]
 
     async def _update_many(
@@ -807,9 +875,10 @@ class RelayProvider:
         need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
         ctxs = [HookContext(table=table, payload=dict(u["data"])) for u in updates]
         ids = [u["id"] for u in updates]
+        dry_run = _dry_run.get()
         async with self._write_transaction(new_transaction=new_transaction) as conn:
             try:
-                async with conn.transaction():
+                async with self._transaction_or_dry_run(conn, dry_run):
                     if need_old:
                         old_rows = await self._psqldb.get_many(table, ids, conn=conn)
                         old_by_id = {r["id"]: dict(r) for r in old_rows}
@@ -840,8 +909,9 @@ class RelayProvider:
                 raise
             for ctx in ctxs:
                 ctx.conn = None
-        for ctx in ctxs:
-            await self._run_hooks_resolved(table, "after_commit", ctx)
+        if not dry_run:
+            for ctx in ctxs:
+                await self._run_hooks_resolved(table, "after_commit", ctx)
         return [ctx.new for ctx in ctxs]
 
     async def save_many(
@@ -876,9 +946,10 @@ class RelayProvider:
             return []
         insert_ctxs: list[HookContext] = []
         update_ctxs: list[HookContext] = []
+        dry_run = _dry_run.get()
         async with self._write_transaction(new_transaction=new_transaction) as conn:
             try:
-                async with conn.transaction():
+                async with self._transaction_or_dry_run(conn, dry_run):
                     resolved: list[tuple[str, UUID | None, dict]] = []
                     for row in rows:
                         row_id = row.get("id")
@@ -956,8 +1027,9 @@ class RelayProvider:
                 raise
             for ctx in [*insert_ctxs, *update_ctxs]:
                 ctx.conn = None
-        for ctx in [*insert_ctxs, *update_ctxs]:
-            await self._run_hooks_resolved(table, "after_commit", ctx)
+        if not dry_run:
+            for ctx in [*insert_ctxs, *update_ctxs]:
+                await self._run_hooks_resolved(table, "after_commit", ctx)
         return [ctx.new for ctx in [*insert_ctxs, *update_ctxs]]
 
     async def delete_many(
@@ -968,9 +1040,10 @@ class RelayProvider:
             return
         need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
         ctxs = [HookContext(table=table) for _ in ids]
+        dry_run = _dry_run.get()
         async with self._write_transaction(new_transaction=new_transaction) as conn:
             try:
-                async with conn.transaction():
+                async with self._transaction_or_dry_run(conn, dry_run):
                     if need_old:
                         old_rows = await self._psqldb.get_many(table, ids, conn=conn)
                         old_by_id = {r["id"]: dict(r) for r in old_rows}
@@ -992,8 +1065,9 @@ class RelayProvider:
                 raise
             for ctx in ctxs:
                 ctx.conn = None
-        for ctx in ctxs:
-            await self._run_hooks_resolved(table, "after_commit", ctx)
+        if not dry_run:
+            for ctx in ctxs:
+                await self._run_hooks_resolved(table, "after_commit", ctx)
 
     # ------------------------------------------------------------------ #
     # Whitelisting — plugins/<plugin>/api/*.py, same controlled-loading
@@ -1095,21 +1169,47 @@ class RelayProvider:
     def whitelist(
         self, *, methods: list[str] | None = None, roles: list[str] | None = None, path: str | None = None
     ) -> Callable[[Callable], Callable]:
-        methods = methods or ["POST"]
-        roles = roles or ["Guest"]
+        """`methods`/`roles` are RESTRICTIONS, applied only when given —
+        never a required allowlist a caller must fill in just to get a
+        sane default:
+
+          * `methods=None` -> every verb in ALL_METHODS is registered; the
+            function body (and the injected `dry_run` kwarg, honored
+            automatically for arc.relay.save/save_many/delete/delete_many
+            via a rollback contextvar — see _transaction_or_dry_run) decides
+            what actually happens, RPC-style. Pass an explicit `methods=[...]`
+            to restrict — e.g. `methods=["POST"]` for something that should
+            never be reachable via a safe/idempotent verb at all.
+          * `roles=None` -> the "*" sentinel (any resolved identity,
+            role-agnostic) — authenticated-by-default, NOT public. Public/
+            Guest access always needs an explicit `roles=["Guest"]` — never
+            a fallback, whether from an omission or from authn happening to
+            be absent.
+        """
+        roles = roles if roles is not None else ["*"]
+        methods = methods if methods is not None else list(ALL_METHODS)
 
         def decorator(fn: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
             plugin = self._loading_plugin or self._kernel.current_plugin() or "<direct>"
             if not self._kernel.has("authn") and set(roles) - {"Guest"}:
-                # Same rule §3.3 already applies everywhere else: declaring a
-                # real role with no way to ever resolve it is a boot-time
-                # config error, not something that quietly does nothing at
-                # request time.
-                raise RuntimeError(
+                # Advisory only, NOT a boot-time error (correction, was a
+                # hard RuntimeError): the system boots cleanly regardless of
+                # authn's presence. Without authn, identity_middleware
+                # always resolves identity=None for every caller, so
+                # _wire_gateway_route's own (unchanged) authorization check
+                # already correctly 403s everyone for ANY non-Guest
+                # requirement — no dummy bypass, no special-casing, the
+                # exact same "wrong role" denial path a real caller with
+                # insufficient roles would hit. This advisory exists purely
+                # so an operator deploying without authn sees, at boot,
+                # which endpoints will be permanently unreachable — the
+                # same "degrade, don't fail, but say so" posture §3.5/§3.11
+                # already use for redix-absent cache/lock.
+                self._kernel.advise(
                     f"whitelisted function '{fn.__name__}' (plugin '{plugin}') declares "
-                    f"roles={roles}, but no authn plugin is installed — only 'Guest' can "
-                    f"ever be granted without one. Install authn, or restrict this to "
-                    f"roles=['Guest']."
+                    f"roles={roles}, but no authn plugin is installed — every request to "
+                    f"it will be rejected with 403 until authn is installed (or this is "
+                    f"changed to roles=['Guest'] for genuinely public access)."
                 )
             name = f"{plugin}.{fn.__name__}"
             derived_path = path or f"/api/method/{name}"
@@ -1117,6 +1217,7 @@ class RelayProvider:
             wf = WhitelistedFunction(
                 name=name, plugin=plugin, fn=fn, methods=methods, roles=roles, path=derived_path,
                 wants_identity="identity" in sig.parameters, wants_client_ip="client_ip" in sig.parameters,
+                wants_dry_run="dry_run" in sig.parameters,
                 signature=sig,
             )
             if wf.name in self._whitelisted:
@@ -1143,18 +1244,20 @@ class RelayProvider:
 
     def _wire_gateway_route(self, wf: WhitelistedFunction) -> None:
         gateway = self._kernel.get("gateway")
-        from gateway.request import HTTPError  # only imported when gateway is actually present
+        from gateway.request import HTTPError, Response  # only imported when gateway is actually present
 
         async def handler(request: Any) -> Any:
             # request.identity is None whenever authn isn't installed, or a
             # request carries no valid credentials — both collapse to
             # caller_roles = {"Guest"}, identical to this cut's old
             # Guest-only behavior, so roles=["Guest"] endpoints (e.g.
-            # example_hr's) are unaffected either way. "*" means "any
-            # resolved identity, role-agnostic" — declaring it with no authn
-            # installed is already refused at registration time above (only
-            # "Guest" can ever be granted without one), so by the time this
-            # runs, "*" here always means authn IS installed.
+            # example_hr's) are unaffected either way. "*" now means EITHER
+            # an explicit roles=["*"] OR the (new) implicit default —
+            # authn absent makes identity always None either way, so this
+            # branch already resolves to `authorized = False` for both
+            # cases with zero special-casing (see whitelist()'s own
+            # docstring — this is what makes the boot-time error safe to
+            # remove: the request-time 403 below was ALREADY correct).
             identity = getattr(request, "identity", None)
             caller_roles = set(getattr(identity, "roles", None) or [])
             if "*" in wf.roles:
@@ -1173,6 +1276,15 @@ class RelayProvider:
             else:
                 authorized = bool((caller_roles | {"Guest"}) & set(wf.roles))
             if not authorized:
+                if identity is None and not self._kernel.has("authn") and set(wf.roles) - {"Guest"}:
+                    # Distinguishable from an ordinary wrong-role denial —
+                    # the caller didn't lack a role, there's structurally no
+                    # way for ANY caller to ever satisfy this endpoint right
+                    # now, because nothing can authenticate anyone.
+                    raise HTTPError(403, {
+                        "error": "forbidden",
+                        "detail": "authentication is required for this endpoint, but no authn plugin is installed",
+                    })
                 raise HTTPError(403, {"error": "forbidden", "detail": f"requires role(s) {wf.roles}"})
             try:
                 body = request.json() if request.body else {}
@@ -1184,13 +1296,34 @@ class RelayProvider:
             # below that would otherwise escape as an unstructured 500.
             if not isinstance(body, dict):
                 raise HTTPError(422, {"error": "JSON body must be an object", "detail": type(body).__name__})
-            kwargs = dict(body)
+            # Query-string args first (the natural way to call a GET),
+            # then the body on top (only ever present for methods that
+            # conventionally carry one) — so a GET with no body works from
+            # query params alone, and an existing POST-only caller sees no
+            # change at all (it never had query params to begin with).
+            # First value per key only (request.query() already does the
+            # same); no type coercion beyond what's already the norm for
+            # any string-arriving-over-HTTP arg (docs' own known
+            # limitation — admin's Data Browser needed the same for JSON).
+            kwargs: dict[str, Any] = {k: v[0] for k, v in request.query_params.items()}
+            kwargs.update(body)
+            # GET is the one verb this system treats as safe/idempotent by
+            # convention — everything else (POST/PUT/PATCH/DELETE) is a
+            # real call, full stop. This signal is what makes an
+            # unrestricted-by-default write endpoint safe: it drives BOTH
+            # the injected `dry_run` kwarg below AND the _dry_run
+            # contextvar every arc.relay.save/save_many/delete/delete_many
+            # call already honors, regardless of whether wf.fn itself asked
+            # for the kwarg.
+            dry_run_signal = request.method == "GET"
             if wf.wants_identity:
                 # Always the server-resolved identity, never a client-supplied
                 # "identity" key in the body — this overwrites it deliberately.
                 kwargs["identity"] = identity
             if wf.wants_client_ip:
                 kwargs["client_ip"] = getattr(request, "client_ip", None)
+            if wf.wants_dry_run:
+                kwargs["dry_run"] = dry_run_signal
             try:
                 # Bind (never call) against the real signature first — this
                 # is where a body with missing/unexpected/mistyped keys
@@ -1202,10 +1335,23 @@ class RelayProvider:
                 wf.signature.bind(**kwargs)
             except TypeError as exc:
                 raise HTTPError(400, {"error": "invalid arguments", "detail": str(exc)}) from exc
+            token = _dry_run.set(dry_run_signal)
             try:
-                return await wf.fn(**kwargs)
+                result = await wf.fn(**kwargs)
             except RelayError as exc:
                 raise HTTPError(exc.status, {"error": exc.message, "code": exc.code}) from exc
+            finally:
+                _dry_run.reset(token)
+            if dry_run_signal:
+                # Never let a dry-run response look indistinguishable from
+                # a real write's — a caller must be able to tell nothing
+                # actually persisted, without having to already know this
+                # endpoint's own semantics.
+                if isinstance(result, Response):
+                    result.headers = {**result.headers, "X-Dry-Run": "true"}
+                    return result
+                return Response(content=result, headers={"X-Dry-Run": "true"})
+            return result
 
         for method in wf.methods:
             gateway.add_route(method, wf.path, handler, summary=f"whitelisted: {wf.name}")
