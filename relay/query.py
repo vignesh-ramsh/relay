@@ -63,12 +63,10 @@ SchemaLookup = Callable[[str], TableSchema]
 class QueryError(ValueError):
     """A caller's filters/fields/order_by/aggregates don't make sense
     against the schema — an unknown table/column/operator, a malformed
-    operator value, a bound exceeded. Always the caller's mistake to fix,
-    same convention psqldb.get_by() already established (a plain ValueError
-    subclass, not a RelayError — see relay/__init__.py's whitelist() error
-    handling, which only converts RelayError into an HTTP response; this
-    matches the pre-existing "unknown field" behavior of get_by() rather
-    than inventing a second error convention for the same kind of mistake)."""
+    operator value, a bound exceeded. Always the caller's mistake to fix —
+    a plain ValueError subclass, not a RelayError (relay/__init__.py's
+    whitelist() error handling only converts RelayError into an HTTP
+    response)."""
 
 
 @dataclass(frozen=True)
@@ -305,6 +303,16 @@ def build_aggregate(
 
     select_parts = [f'"{g}"' for g in group_by]
     for alias, spec in aggregates.items():
+        # The alias is the ONE caller-supplied identifier in the engine that
+        # can't be validated against the schema (it's an output name, not a
+        # column) — so it gets the same whitelist treatment everything else
+        # here gets, or a '"' inside it would break out of the quoted
+        # identifier position it's interpolated into below.
+        if not isinstance(alias, str) or not alias.isidentifier():
+            raise QueryError(
+                f"aggregate alias {alias!r} must be a plain identifier "
+                f"(letters, digits, underscores; not starting with a digit)."
+            )
         if not isinstance(spec, (list, tuple)) or len(spec) != 2:
             raise QueryError(f"aggregate '{alias}': expected a (function, field) pair, got {spec!r}.")
         fn, field_name = spec

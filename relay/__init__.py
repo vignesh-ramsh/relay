@@ -5,10 +5,10 @@ Exports `arc.relay`: hook-wrapped CRUD over whatever tables `psqldb` has
 already declared (schemas/patches, §3.9) — Relay never redeclares the data
 model, it only attaches behavior to one psqldb already owns. Single-row +
 batch writes (save/save_many/delete/delete_many), the full hook taxonomy,
-cache/lock/queue, whitelisting, and the bounded Query Engine
-(get/list/count/aggregate/sql — see relay.query) are built; RBAC beyond
-Guest-only and streaming are separate, later increments — see
-docs/arc.MD §7 for the build order this follows.
+cache/lock/queue, whitelisting with full role-intersection RBAC (§3.11/
+§3.13), and the bounded Query Engine (get/list/count/aggregate/sql — see
+relay.query) are all built; streaming remains a separate, later increment
+— see docs/arc.MD §7 for the build order this follows.
 
 Two things worth knowing before reading the CRUD section below:
 
@@ -42,6 +42,7 @@ import contextlib
 import importlib.util
 import inspect
 import sys
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -283,8 +284,20 @@ class RelayProvider:
         self._loading_plugin: str | None = None
         # Fallback cache/lock state, used only when redix isn't installed —
         # see cache_get/set/lock below for what's actually weaker about it.
-        self._local_cache: dict[str, Any] = {}
-        self._local_locks: dict[str, asyncio.Lock] = {}
+        # _local_cache maps key -> (value, monotonic-expiry-or-None): expiry
+        # is checked on read rather than via a detached asyncio timer task
+        # (which asyncio only weak-references — it could be GC-cancelled and
+        # silently never expire the key). _local_locks holds a refcount per
+        # name so an entry is dropped the moment the last holder/waiter
+        # leaves — the earlier grow-forever dict leaked one permanent Lock
+        # per distinct save() match_on value.
+        self._local_cache: dict[str, tuple[Any, float | None]] = {}
+        self._local_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+        # Strong references to fire-and-forget tasks (enqueue's handoff/
+        # fallback runners) — asyncio holds only a WEAK reference to a task,
+        # so one nothing else references can be garbage-collected mid-flight
+        # and silently cancelled. Same fix authn already carries (§3.13).
+        self._background_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------ #
     # Hook registration — plugins/<plugin>/hooks/<Table Name>.py, same
@@ -368,6 +381,30 @@ class RelayProvider:
         for fn in self._hooks.get((table, event), ()):
             await fn(ctx)
 
+    async def _run_hooks_resolved(self, table: str, event: HookEvent, ctx: HookContext) -> None:
+        """For on_rollback/after_commit ONLY — events that fire after the
+        transaction's outcome is already decided. A hook raising here must
+        never mask the original failure (on_rollback runs inside the except
+        block, so an uncaught hook error would REPLACE the exception the
+        caller needs to see) nor make a committed write look failed
+        (after_commit runs after a successful commit). Logged and
+        swallowed; precommit hooks keep their raise-aborts-the-write
+        semantics untouched via _run_hooks above."""
+        for fn in self._hooks.get((table, event), ()):
+            try:
+                await fn(ctx)
+            except Exception as exc:
+                self.log(
+                    f"{event} hook '{getattr(fn, '__name__', fn)!s}' on '{table}' raised "
+                    f"{type(exc).__name__}: {exc} — ignored (transaction already resolved)",
+                    level="error",
+                )
+
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     # ------------------------------------------------------------------ #
     # Session-bound connections (module docstring; docs/arc.MD §8's arc.di
     # gap, minimal/targeted version). _connection() is what every read AND
@@ -412,7 +449,7 @@ class RelayProvider:
     # Not kept as deprecated aliases: this project carries no version
     # number and no back-compat promise yet (docs/arc.MD §1).
     # ------------------------------------------------------------------ #
-    async def _insert(self, table: str, data: dict, *, by: UUID | None = None, new_transaction: bool = False) -> dict:
+    async def _insert(self, table: str, data: dict, *, by: str | None = None, new_transaction: bool = False) -> dict:
         self._psqldb.schema(table)  # SchemaError early if unknown, before opening anything
         ctx = HookContext(table=table, old=None, payload=dict(data))
         ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
@@ -429,14 +466,14 @@ class RelayProvider:
             except Exception as exc:
                 ctx.conn = None
                 ctx.error = exc
-                await self._run_hooks(table, "on_rollback", ctx)
+                await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             ctx.conn = None
-        await self._run_hooks(table, "after_commit", ctx)
+        await self._run_hooks_resolved(table, "after_commit", ctx)
         return ctx.new
 
     async def _update(
-        self, table: str, id: UUID, data: dict, *, by: UUID | None = None, new_transaction: bool = False
+        self, table: str, id: UUID, data: dict, *, by: str | None = None, new_transaction: bool = False
     ) -> dict | None:
         self._psqldb.schema(table)
         ctx = HookContext(table=table, payload=dict(data))
@@ -457,10 +494,10 @@ class RelayProvider:
             except Exception as exc:
                 ctx.conn = None
                 ctx.error = exc
-                await self._run_hooks(table, "on_rollback", ctx)
+                await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             ctx.conn = None
-        await self._run_hooks(table, "after_commit", ctx)
+        await self._run_hooks_resolved(table, "after_commit", ctx)
         return ctx.new
 
     async def save(
@@ -469,13 +506,16 @@ class RelayProvider:
         data: dict,
         *,
         match_on: list[str] | None = None,
-        by: UUID | None = None,
+        by: str | None = None,
         new_transaction: bool = False,
     ) -> dict:
         """Insert-or-update, one method (docs/relay/Sample.MD).
 
         `data["id"]` present -> update that row directly, no match_on
-        needed. Otherwise, `match_on` given -> look up by those field(s):
+        needed — a hard QueryError if no row has that id (a stale id
+        silently doing nothing, and returning None, is the one behavior
+        nobody would choose from an "insert-or-update" contract).
+        Otherwise, `match_on` given -> look up by those field(s):
         0 matches -> insert, 1 match -> update, MORE than 1 -> a hard
         error — save() is a strictly single-row contract; use save_many()
         for an intentional fan-out. Neither id nor match_on -> plain
@@ -484,20 +524,29 @@ class RelayProvider:
         match_on doesn't have to name a DB-unique field — if you want that
         enforced even for direct create()/save() calls bypassing this
         lookup, that's a `validate` hook's job, not this method's. What
-        THIS method guarantees on its own: the lookup-then-branch sequence
-        below is wrapped in arc.relay.lock(), so two concurrent save()
-        calls for the SAME match_on values can't both see "no match" and
-        both insert — the classic upsert race. (Real guarantee with redix
-        installed; same weaker in-process-only fallback as every other
-        arc.relay.lock() use otherwise — see lock()'s own docstring.)
+        THIS method guarantees on its own: the ENTIRE lookup-then-branch
+        sequence — including the no-match insert — runs inside one
+        arc.relay.lock(), so two concurrent save() calls for the SAME
+        match_on values can't both see "no match" and both insert — the
+        classic upsert race. (Real guarantee with redix installed; same
+        weaker in-process-only fallback as every other arc.relay.lock()
+        use otherwise — see lock()'s own docstring.)
         """
         if data.get("id") is not None:
             payload = {k: v for k, v in data.items() if k != "id"}
-            return await self._update(table, data["id"], payload, by=by, new_transaction=new_transaction)
+            updated = await self._update(table, data["id"], payload, by=by, new_transaction=new_transaction)
+            if updated is None:
+                raise query.QueryError(
+                    f"save(): no row on '{table}' with id {data['id']!r} — an explicit id "
+                    f"always means update; to insert, omit the id (or use match_on)."
+                )
+            return updated
 
         if match_on:
             filters = {f: data[f] for f in match_on}
-            lock_key = f"relay:save:{table}:{sorted(filters.items())}"
+            # str() every value so the same logical key always locks the same
+            # name regardless of how the caller spelled it (UUID vs str, ...).
+            lock_key = f"relay:save:{table}:{sorted((k, str(v)) for k, v in filters.items())}"
             async with self.lock(lock_key):
                 matches = await self.list(
                     table, filters=filters, fields=["id"], limit=2, new_transaction=new_transaction
@@ -512,11 +561,18 @@ class RelayProvider:
                     return await self._update(
                         table, matches[0]["id"], payload, by=by, new_transaction=new_transaction
                     )
+                # The insert MUST happen while the lock is still held — it used
+                # to sit after this block, so the lock was released between
+                # "saw no match" and "inserted", and two concurrent saves could
+                # both reach here and both insert: the exact race the lock
+                # exists to prevent.
+                payload = {k: v for k, v in data.items() if k != "id"}
+                return await self._insert(table, payload, by=by, new_transaction=new_transaction)
 
         payload = {k: v for k, v in data.items() if k != "id"}
         return await self._insert(table, payload, by=by, new_transaction=new_transaction)
 
-    async def delete(self, table: str, id: UUID, *, by: UUID | None = None, new_transaction: bool = False) -> None:
+    async def delete(self, table: str, id: UUID, *, by: str | None = None, new_transaction: bool = False) -> None:
         self._psqldb.schema(table)
         ctx = HookContext(table=table)
         async with self._write_transaction(new_transaction=new_transaction) as conn:
@@ -533,10 +589,10 @@ class RelayProvider:
             except Exception as exc:
                 ctx.conn = None
                 ctx.error = exc
-                await self._run_hooks(table, "on_rollback", ctx)
+                await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             ctx.conn = None
-        await self._run_hooks(table, "after_commit", ctx)
+        await self._run_hooks_resolved(table, "after_commit", ctx)
 
     # ------------------------------------------------------------------ #
     # Query Engine (docs/arc.MD §3.4) — get/list/count/aggregate all funnel
@@ -706,7 +762,7 @@ class RelayProvider:
     # not a distinct capability.
     # ------------------------------------------------------------------ #
     async def _insert_many(
-        self, table: str, rows: list[dict], *, by: UUID | None = None, new_transaction: bool = False
+        self, table: str, rows: list[dict], *, by: str | None = None, new_transaction: bool = False
     ) -> list[dict]:
         self._psqldb.schema(table)
         if not rows:
@@ -733,16 +789,16 @@ class RelayProvider:
                 for ctx in ctxs:
                     ctx.conn = None
                     ctx.error = exc
-                    await self._run_hooks(table, "on_rollback", ctx)
+                    await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             for ctx in ctxs:
                 ctx.conn = None
         for ctx in ctxs:
-            await self._run_hooks(table, "after_commit", ctx)
+            await self._run_hooks_resolved(table, "after_commit", ctx)
         return [ctx.new for ctx in ctxs]
 
     async def _update_many(
-        self, table: str, updates: list[dict], *, by: UUID | None = None, new_transaction: bool = False
+        self, table: str, updates: list[dict], *, by: str | None = None, new_transaction: bool = False
     ) -> list[dict]:
         """`updates` is `[{"id": ..., "data": {...}}, ...]`."""
         self._psqldb.schema(table)
@@ -780,12 +836,12 @@ class RelayProvider:
                 for ctx in ctxs:
                     ctx.conn = None
                     ctx.error = exc
-                    await self._run_hooks(table, "on_rollback", ctx)
+                    await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             for ctx in ctxs:
                 ctx.conn = None
         for ctx in ctxs:
-            await self._run_hooks(table, "after_commit", ctx)
+            await self._run_hooks_resolved(table, "after_commit", ctx)
         return [ctx.new for ctx in ctxs]
 
     async def save_many(
@@ -794,7 +850,7 @@ class RelayProvider:
         rows: list[dict],
         *,
         match_on: list[str] | None = None,
-        by: UUID | None = None,
+        by: str | None = None,
         limit: int | None = None,
         new_transaction: bool = False,
     ) -> list[dict]:
@@ -896,16 +952,16 @@ class RelayProvider:
                 for ctx in [*insert_ctxs, *update_ctxs]:
                     ctx.conn = None
                     ctx.error = exc
-                    await self._run_hooks(table, "on_rollback", ctx)
+                    await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             for ctx in [*insert_ctxs, *update_ctxs]:
                 ctx.conn = None
         for ctx in [*insert_ctxs, *update_ctxs]:
-            await self._run_hooks(table, "after_commit", ctx)
+            await self._run_hooks_resolved(table, "after_commit", ctx)
         return [ctx.new for ctx in [*insert_ctxs, *update_ctxs]]
 
     async def delete_many(
-        self, table: str, ids: list[UUID], *, by: UUID | None = None, new_transaction: bool = False
+        self, table: str, ids: list[UUID], *, by: str | None = None, new_transaction: bool = False
     ) -> None:
         self._psqldb.schema(table)
         if not ids:
@@ -932,12 +988,12 @@ class RelayProvider:
                 for ctx in ctxs:
                     ctx.conn = None
                     ctx.error = exc
-                    await self._run_hooks(table, "on_rollback", ctx)
+                    await self._run_hooks_resolved(table, "on_rollback", ctx)
                 raise
             for ctx in ctxs:
                 ctx.conn = None
         for ctx in ctxs:
-            await self._run_hooks(table, "after_commit", ctx)
+            await self._run_hooks_resolved(table, "after_commit", ctx)
 
     # ------------------------------------------------------------------ #
     # Whitelisting — plugins/<plugin>/api/*.py, same controlled-loading
@@ -1179,18 +1235,29 @@ class RelayProvider:
         if self._redix is not None:
             raw = await self._redix.get(self._cache_key(key))
             return arc.codec.decode(raw) if raw is not None else None
-        return self._local_cache.get(key)
+        entry = self._local_cache.get(key)
+        if entry is None:
+            return None
+        value, expires_at = entry
+        if expires_at is not None and time.monotonic() >= expires_at:
+            self._local_cache.pop(key, None)
+            return None
+        return value
 
     async def cache_set(self, key: str, value: Any, *, ex: int | None = None) -> None:
         if self._redix is not None:
             await self._redix.set(self._cache_key(key), arc.codec.encode(value), ex=ex)
             return
-        self._local_cache[key] = value
-        if ex is not None:
-            async def _expire() -> None:
-                await asyncio.sleep(ex)
-                self._local_cache.pop(key, None)
-            asyncio.create_task(_expire())
+        # Expiry is a stored deadline checked on read — NOT a detached
+        # asyncio.sleep() task (asyncio only weak-references tasks; an
+        # unreferenced one can be GC-cancelled and the key then never
+        # expires). Setting also sweeps any already-expired entries so the
+        # fallback dict can't grow unboundedly on write-once keys.
+        self._local_cache[key] = (value, time.monotonic() + ex if ex is not None else None)
+        if len(self._local_cache) % 256 == 0:
+            now = time.monotonic()
+            for k in [k for k, (_v, exp) in self._local_cache.items() if exp is not None and now >= exp]:
+                self._local_cache.pop(k, None)
 
     async def cache_delete(self, key: str) -> None:
         if self._redix is not None:
@@ -1213,9 +1280,29 @@ class RelayProvider:
 
     @contextlib.asynccontextmanager
     async def _local_lock_cm(self, name: str):
-        lock = self._local_locks.setdefault(name, asyncio.Lock())
-        async with lock:
-            yield
+        # Refcounted: the entry lives while any task holds OR waits on the
+        # lock, and is dropped when the last one leaves — a plain
+        # setdefault() dict grew one permanent Lock per distinct name for
+        # the life of the process (save()'s match_on locks are keyed by
+        # DATA VALUES, so that was an unbounded leak). The refcount, not
+        # lock.locked(), decides removal: popping a lock another task still
+        # waits on would let a newcomer mint a second Lock under the same
+        # name and break mutual exclusion.
+        entry = self._local_locks.get(name)
+        if entry is None:
+            lock, count = asyncio.Lock(), 0
+        else:
+            lock, count = entry
+        self._local_locks[name] = (lock, count + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock2, count2 = self._local_locks[name]
+            if count2 <= 1:
+                del self._local_locks[name]
+            else:
+                self._local_locks[name] = (lock2, count2 - 1)
 
     def enqueue(
         self, fn: Callable[..., Awaitable[Any]], *args: Any, queue: str = "default", **kwargs: Any
@@ -1263,7 +1350,9 @@ class RelayProvider:
                 lineup.check_resolvable(fn)  # raises TypeError here, synchronously, before any Task exists
                 coro = lineup.enqueue_by_path(fn, *args, queue=queue, **kwargs)
 
-            task = asyncio.create_task(coro)
+            # _track_task: most callers drop the returned Task — without a
+            # strong reference here it could be GC-cancelled mid-handoff.
+            task = self._track_task(asyncio.create_task(coro))
 
             def _on_enqueue_done(t: asyncio.Task) -> None:
                 if t.cancelled():
@@ -1309,7 +1398,7 @@ class RelayProvider:
                 except Exception as log_exc:
                     self.log(f"failed to write _job_log row for {fn.__name__}: {log_exc}", level="error")
 
-        task = asyncio.create_task(_run_and_log())
+        task = self._track_task(asyncio.create_task(_run_and_log()))
 
         def _on_done(t: asyncio.Task) -> None:
             if t.cancelled():
@@ -1346,6 +1435,11 @@ class RelayProvider:
 
 
 def register(kernel: Any) -> None:
+    # The one knob governing _job_log retention (_maintenance.prune_job_log)
+    # — declared here so it's discoverable via arc.settings.list_all() and
+    # admin's Settings page (§3.5: declare once, by the owning plugin).
+    kernel.settings.declare("job_log_retention_days")
+
     provider = RelayProvider(kernel)
     if not kernel.has("redix"):
         kernel.advise(
