@@ -41,6 +41,7 @@ import asyncio
 import contextlib
 import importlib.util
 import inspect
+import logging
 import sys
 import time
 from contextvars import ContextVar
@@ -49,8 +50,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
-
-from rich.console import Console
 
 import arc  # safe at module level — same pattern gateway/request.py already uses;
             # arc.codec is stateless and needs no active kernel to be imported
@@ -75,8 +74,15 @@ HookEvent = Literal[
 PRECOMMIT_EVENTS = frozenset({"validate", "before_save", "after_save", "before_delete", "after_delete"})
 POSTCOMMIT_EVENTS = frozenset({"after_commit", "on_rollback"})
 
-_console = Console()
-_LOG_STYLES = {"info": "cyan", "success": "bold green", "warning": "yellow", "error": "bold red"}
+_logger = logging.getLogger("relay")
+# "success" isn't a real stdlib logging level — mapped to INFO for dispatch,
+# but preserved as-is in the JSON output (arc.log.JsonFormatter reads
+# record.relay_level when present) so a caller's own info/success/warning/
+# error vocabulary survives into structured logs, not just console text.
+_LOG_LEVELS = {
+    "info": logging.INFO, "success": logging.INFO,
+    "warning": logging.WARNING, "error": logging.ERROR,
+}
 
 
 class RelayError(Exception):
@@ -1713,17 +1719,22 @@ class RelayProvider:
         return task
 
     # ------------------------------------------------------------------ #
-    # Error / logging — arc.relay.throw() / .log(). log() is console-only
-    # for now (deliberate, see docs/arc.MD §8) — structured/persisted
-    # logging is a separate, later decision.
+    # Error / logging — arc.relay.throw() / .log(). log() used to be
+    # console-only, by deliberate choice, pending a later decision on real
+    # structured/persisted logging (docs/arc.MD §8) — arc.log (§3.10) is
+    # that decision. log() now goes through logging.getLogger("relay"),
+    # same as every other plugin's own logger, so it gets arc.log's console
+    # + rotating JSON file handlers for free instead of a second, separate
+    # rich.Console output nothing else in the system shared.
     # ------------------------------------------------------------------ #
     def throw(self, message: str, *, status: int = 400, code: str | None = None) -> None:
         raise RelayError(message, status=status, code=code)
 
     def log(self, message: str, *, level: str = "info", **context: Any) -> None:
-        style = _LOG_STYLES.get(level, "white")
-        suffix = f" {context}" if context else ""
-        _console.print(f"[{style}][{level.upper()}][/{style}] {message}{suffix}")
+        _logger.log(
+            _LOG_LEVELS.get(level, logging.INFO), message,
+            extra={"relay_level": level, **context},
+        )
 
     async def health(self) -> dict:
         hook_count = sum(len(fns) for fns in self._hooks.values())
