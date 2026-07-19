@@ -288,6 +288,43 @@ _active_conn: ContextVar[Any | None] = ContextVar("arc_relay_active_conn", defau
 # injection (WhitelistedFunction.wants_dry_run) if they choose to.
 _dry_run: ContextVar[bool] = ContextVar("arc_relay_dry_run", default=False)
 
+# Set only for the duration of arc.relay.stream()'s own internal coroutine-
+# driving loop (below) — read by arc.relay.publish() to find "the queue for
+# whatever stream is currently running in this task," if any. task-scoped
+# and inherited across awaits, same as _active_conn/_dry_run above, which is
+# what lets publish() work when called from deep inside the streamed
+# coroutine's own call chain (e.g. a hook it triggers) with no extra
+# plumbing. None (the default) means "no stream is currently active" —
+# publish() treats that as "nobody's listening" and is a silent no-op,
+# never an error.
+_active_stream: ContextVar["asyncio.Queue | None"] = ContextVar("arc_relay_active_stream", default=None)
+
+
+class RelayStream:
+    """Returned by arc.relay.stream() — a thin async-iterator wrapper, not a
+    new response-format concept of its own. Two ways this gets consumed:
+      * Gateway installed, reached over HTTP (_wire_gateway_route below):
+        recognized by this type and turned into a live, chunked HTTP
+        response (gateway.request.StreamResponse) — each item this
+        iterates is one chunk sent to the client as soon as it's produced,
+        instead of buffering the whole thing first.
+      * Called any other way (arc.relay.call(), a hook, the CLI, no Gateway
+        installed at all): there's no open connection to push chunks down,
+        so the caller gets no special treatment automatically — see
+        RelayProvider.call()'s own draining fallback, which runs this
+        iterator to completion and hands back only the LAST item, exactly
+        like calling any other function that just returns its result.
+    """
+
+    def __init__(self, source: Any) -> None:
+        self._source = source.__aiter__() if hasattr(source, "__aiter__") else source
+
+    def __aiter__(self) -> "RelayStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        return await self._source.__anext__()
+
 
 class _DryRunRollback(Exception):
     """Internal sentinel only — never escapes _transaction_or_dry_run, never
@@ -1240,11 +1277,100 @@ class RelayProvider:
         wf = self._whitelisted.get(name)
         if wf is None:
             raise RelayError(f"no whitelisted function named '{name}'", status=404, code="not_found")
-        return await wf.fn(**kwargs)
+        result = await wf.fn(**kwargs)
+        if isinstance(result, RelayStream):
+            # No open HTTP connection exists here to push chunks down (this
+            # is a direct, in-process call) — drain the whole thing and
+            # hand back only the last item, so a caller gets the exact
+            # same "one normal return value" shape whether or not the
+            # function it called happens to use arc.relay.stream()
+            # internally. See RelayStream's own docstring for why the last
+            # item is the meaningful one (arc.relay.publish()'s progress
+            # pings are interim, the final yield/return is the real result).
+            last = None
+            async for last in result:
+                pass
+            return last
+        return result
+
+    def stream(self, source: Any) -> RelayStream:
+        """Wraps `source` so it can be returned from a whitelisted function
+        as a live, chunked response instead of one buffered blob — for two
+        distinct reasons to reach for this, not one:
+
+          * A large payload (a big export, a big query result, a file) —
+            pass an async generator that yields pieces of it. Nothing here
+            is redix-backed or cross-process; it's plain chunked transfer
+            on the one connection that's already open, purely so the
+            server never has to hold the whole thing in memory at once.
+          * A long-running action that wants to keep its OWN caller
+            informed while it works — pass a plain coroutine (not a
+            generator) that calls arc.relay.publish(event, **payload) as it
+            goes and returns its real result at the end; stream() drives
+            that coroutine itself and turns each publish() call plus the
+            final return value into the sequence of chunks sent out.
+
+        Both cases return the identical RelayStream wrapper — Gateway (and
+        arc.relay.call()'s own fallback) don't need to know or care which
+        kind of source produced it.
+        """
+        if inspect.iscoroutine(source):
+            return RelayStream(self._drive_coroutine(source))
+        return RelayStream(source)
+
+    async def _drive_coroutine(self, coro: Any):
+        """Runs `coro` as a background task while concurrently yielding
+        whatever arc.relay.publish() sends into its queue, in the order
+        it's sent, live — then yields the coroutine's own return value
+        last, once it finishes. _active_stream is scoped to this task via
+        asyncio.create_task's own context-copying (same task-scoped
+        propagation _active_conn/_dry_run already rely on elsewhere), so a
+        publish() call made from arbitrarily deep inside coro's own call
+        chain (a hook it triggers, a function it calls) finds this queue
+        with no extra plumbing."""
+        queue: asyncio.Queue = asyncio.Queue()
+        token = _active_stream.set(queue)
+        try:
+            task = asyncio.ensure_future(coro)
+            get_next = asyncio.ensure_future(queue.get())
+            try:
+                while True:
+                    done, _pending = await asyncio.wait({get_next, task}, return_when=asyncio.FIRST_COMPLETED)
+                    if get_next in done:
+                        yield get_next.result()
+                        get_next = asyncio.ensure_future(queue.get())
+                    if task in done:
+                        get_next.cancel()
+                        while not queue.empty():
+                            yield queue.get_nowait()
+                        yield task.result()
+                        return
+            finally:
+                get_next.cancel()
+        finally:
+            _active_stream.reset(token)
+
+    async def publish(self, event: str, **payload: Any) -> None:
+        """Pushes one small update into whichever arc.relay.stream()-driven
+        coroutine is currently running in this task, if any — read the
+        design note on _active_stream above for exactly what "currently
+        running in this task" means. No active stream (this wasn't called
+        from inside a stream()-driven coroutine at all, or the function
+        was invoked directly rather than through Gateway's live path) is
+        NOT an error: it just means nobody is in a position to receive
+        this update right now, so it's silently dropped — the same
+        "degrade, don't fail" posture already used for cache/lock/enqueue
+        when redix/lineup are absent (§3.11), except here there's no
+        install-a-plugin fix for it; it's simply a property of how the
+        enclosing function was called."""
+        queue = _active_stream.get()
+        if queue is None:
+            return
+        await queue.put({"event": event, **payload})
 
     def _wire_gateway_route(self, wf: WhitelistedFunction) -> None:
         gateway = self._kernel.get("gateway")
-        from gateway.request import HTTPError, Response  # only imported when gateway is actually present
+        from gateway.request import HTTPError, Response, StreamResponse  # only imported when gateway is actually present
 
         async def handler(request: Any) -> Any:
             # request.identity is None whenever authn isn't installed, or a
@@ -1342,6 +1468,36 @@ class RelayProvider:
                 raise HTTPError(exc.status, {"error": exc.message, "code": exc.code}) from exc
             finally:
                 _dry_run.reset(token)
+            if isinstance(result, RelayStream):
+                # A stream is a live read, not a write whose outcome needs
+                # hiding behind X-Dry-Run — GET already means "safe" for
+                # every OTHER whitelisted function via dry_run, and a
+                # stream-returning function is no different; hand it
+                # straight to Gateway's chunked-response path instead of
+                # going through the dry-run wrapping below, which assumes
+                # a single, already-complete value.
+                #
+                # Real correctness subtlety this handles: wf.fn() above
+                # only CONSTRUCTS the RelayStream (an unstarted async
+                # generator) — the streamed coroutine, and any
+                # arc.relay.save/delete it makes, doesn't actually run
+                # until Gateway's send_stream iterates it, which happens
+                # AFTER this handler returns, i.e. after the _dry_run.reset()
+                # a few lines up already fired. Without re-establishing
+                # dry_run around that later iteration, a GET against a
+                # stream()-returning write would silently persist for real
+                # — re-scoping it here, around the actual iteration, is
+                # what keeps the same guarantee dry_run gives every other
+                # whitelisted write.
+                async def _dry_run_scoped(stream: RelayStream):
+                    inner_token = _dry_run.set(dry_run_signal)
+                    try:
+                        async for chunk in stream:
+                            yield chunk
+                    finally:
+                        _dry_run.reset(inner_token)
+
+                return StreamResponse(source=_dry_run_scoped(result))
             if dry_run_signal:
                 # Never let a dry-run response look indistinguishable from
                 # a real write's — a caller must be able to tell nothing
