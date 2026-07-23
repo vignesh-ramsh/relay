@@ -43,6 +43,8 @@ from typing import Any, Callable
 from psqldb.fields import Field
 from psqldb.model import TableSchema
 
+from .resolvers import FieldResolver
+
 MAX_ORDER_FIELDS = 5
 MAX_AGGREGATES = 10
 
@@ -203,7 +205,7 @@ def build_select(
     schema: TableSchema,
     *,
     filters: dict[str, Any] | None,
-    fields: list[str | Resolve] | None,
+    fields: list[str | Resolve | FieldResolver] | None,
     order_by: list[str] | None,
     limit: int | None,
     offset: int,
@@ -250,6 +252,16 @@ def build_select(
                     seen_aliases.add(alias)
                 for sf in item.subfields:
                     select_parts.append(f'"{alias}"."{sf}" AS "{alias}.{sf}"')
+            elif isinstance(item, FieldResolver):
+                # Selected exactly like a plain column — the resolver only
+                # changes what happens to the value AFTER the fetch (see
+                # relay.resolvers / RelayProvider._resolve_fields), not how
+                # it's read out of SQL.
+                if item.field not in own_columns:
+                    raise QueryError(
+                        f"unknown column '{item.field}' on table '{table}' (known: {sorted(own_columns)})."
+                    )
+                select_parts.append(f'"{table}"."{item.field}" AS "{item.field}"')
             else:
                 if item not in own_columns:
                     raise QueryError(f"unknown column '{item}' on table '{table}' (known: {sorted(own_columns)}).")

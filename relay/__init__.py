@@ -55,6 +55,7 @@ import arc  # safe at module level — same pattern gateway/request.py already u
             # arc.codec is stateless and needs no active kernel to be imported
 
 from . import query
+from .resolvers import FieldResolver
 
 CAPABILITY = "relay"
 
@@ -64,7 +65,16 @@ CAPABILITY = "relay"
 # actual behavior, RPC-style). OPTIONS is deliberately excluded — CORS
 # preflight is already handled entirely by cors_middleware upstream of
 # routing, so a whitelisted route never needs to own that verb itself.
-ALL_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+# QUERY (IETF draft, safe + idempotent like GET but WITH a body) is
+# included here for the same "RPC-style, verb doesn't restrict" reasoning
+# — gateway.router matches methods as plain strings (no fixed enum) and
+# Granian passes arbitrary method tokens straight through to ASGI
+# (verified directly: `curl -X QUERY` reaches this app's own routing, not
+# a transport-level rejection), so there's nothing QUERY-specific either
+# of them needs to know about. A client that can't send QUERY (older
+# browser fetch()/XHR implementations) always has GET or POST as a
+# fallback on any endpoint that hasn't deliberately restricted `methods`.
+ALL_METHODS = ("GET", "QUERY", "POST", "PUT", "PATCH", "DELETE")
 
 HookEvent = Literal[
     "validate", "before_save", "after_save",
@@ -247,7 +257,20 @@ class WhitelistedFunction:
     wants_client_ip: the same mechanism, mirrored, for a function that
     declares a `client_ip` parameter — e.g. authn.login()'s per-(ip,email)
     rate limiting, which has no other way to see the caller's resolved,
-    proxy-aware IP (gateway.middleware.client_ip_middleware) short of this."""
+    proxy-aware IP (gateway.middleware.client_ip_middleware) short of this.
+    wants_cookies: the same mechanism again, for a function that declares a
+    `cookies` parameter — e.g. authn.logout(), which has to read the
+    arc_session cookie itself to know which specific session to revoke
+    (identity alone only says WHO, not which of that user's sessions this
+    particular request's cookie belongs to).
+    wants_request: the same mechanism again, for a function that declares a
+    `request` parameter — the raw gateway.request.Request, for the rare
+    handler that genuinely needs something no JSON-kwarg shape can carry
+    (e.g. filer's file_upload(), which calls request.form() for the raw
+    multipart body — arc.relay.call()'s **kwargs contract has no way to
+    represent an uploaded file's bytes at all). Every other whitelisted
+    function keeps working exactly as before without knowing this exists,
+    same as every wants_* flag above."""
     name: str            # "<plugin>.<function_name>" — also arc.relay.call()'s key
     plugin: str
     fn: Callable[..., Awaitable[Any]]
@@ -256,6 +279,8 @@ class WhitelistedFunction:
     path: str
     wants_identity: bool = False
     wants_client_ip: bool = False
+    wants_cookies: bool = False
+    wants_request: bool = False
     wants_dry_run: bool = False  # same mechanism, mirrored, for a function that
                                   # declares a `dry_run` parameter — True whenever
                                   # the inbound request used a safe/idempotent verb
@@ -270,6 +295,8 @@ class WhitelistedFunction:
                             # _wire_gateway_route uses signature.bind() to reject a
                             # malformed body as a 400 before ever calling fn, rather
                             # than recomputing inspect.signature(fn) per request
+    max_body_bytes: int | None = None  # None -> gateway's own shared ceiling;
+                                        # passed straight through to gateway.add_route()
 
 
 # The ambient "current write's connection" — set only for the duration of a
@@ -715,7 +742,7 @@ class RelayProvider:
         self,
         table: str,
         key: UUID | str | dict[str, Any],
-        fields: list[str | query.Resolve] | None = None,
+        fields: list[str | query.Resolve | FieldResolver] | None = None,
         *,
         new_transaction: bool = False,
     ) -> dict | None:
@@ -742,7 +769,7 @@ class RelayProvider:
         table: str,
         *,
         filters: dict[str, Any] | None = None,
-        fields: list[str | query.Resolve] | None = None,
+        fields: list[str | query.Resolve | FieldResolver] | None = None,
         order_by: list[str] | None = None,
         limit: int | None = None,
         offset: int = 0,
@@ -765,7 +792,7 @@ class RelayProvider:
         table: str,
         *,
         filters: dict[str, Any] | None,
-        fields: list[str | query.Resolve] | None,
+        fields: list[str | query.Resolve | FieldResolver] | None,
         order_by: list[str] | None,
         limit: int | None,
         offset: int,
@@ -779,24 +806,48 @@ class RelayProvider:
         )
         async with self._connection(new_transaction=new_transaction) as conn:
             rows = await conn.fetch(sql, *params)
-        return [self._shape_row(dict(r), fields) for r in rows]
+        shaped = [self._shape_row(dict(r), fields) for r in rows]
+        if fields:
+            await self._resolve_fields(shaped, fields)
+        return shaped
 
     @staticmethod
-    def _shape_row(flat: dict, fields: list[str | query.Resolve] | None) -> dict:
+    def _shape_row(flat: dict, fields: list[str | query.Resolve | FieldResolver] | None) -> dict:
         """SELECT * (fields=None) returns the flat row unchanged, same as
         every other CRUD method. An explicit `fields` list re-nests each
         arc.relay.resolve(...) entry's flat "field.subfield" column aliases
-        back into row[field] = {subfield: value, ...} — everything else
-        (plain column names) passes through as a top-level key."""
+        back into row[field] = {subfield: value, ...}; a FieldResolver
+        entry (e.g. arc.filer.url(...)) passes its raw column value
+        through unchanged here — _resolve_fields overwrites it with the
+        resolved value afterward. Everything else (plain column names)
+        passes through as a top-level key."""
         if fields is None:
             return flat
         out: dict[str, Any] = {}
         for item in fields:
             if isinstance(item, query.Resolve):
                 out[item.field] = {sf: flat.get(f"{item.field}.{sf}") for sf in item.subfields}
+            elif isinstance(item, FieldResolver):
+                out[item.field] = flat.get(item.field)
             else:
                 out[item] = flat.get(item)
         return out
+
+    @staticmethod
+    async def _resolve_fields(rows: list[dict], fields: list[str | query.Resolve | FieldResolver]) -> None:
+        """Applies every FieldResolver marker in `fields`, in place. Each
+        resolver's prepare() runs exactly ONCE per query — regardless of
+        row count — with every row's raw value for its field already
+        collected; resolve() then runs per row against that shared
+        context. This is what keeps arc.filer.url() (and any future
+        FieldResolver) free of N+1 queries — see relay.resolvers."""
+        for item in fields:
+            if not isinstance(item, FieldResolver):
+                continue
+            raw_values = [row[item.field] for row in rows]
+            context = await item.prepare(raw_values)
+            for row in rows:
+                row[item.field] = item.resolve(row[item.field], context)
 
     async def count(self, table: str, *, filters: dict[str, Any] | None = None, new_transaction: bool = False) -> int:
         schema = self._psqldb.schema(table)
@@ -1210,7 +1261,8 @@ class RelayProvider:
         return decorator
 
     def whitelist(
-        self, *, methods: list[str] | None = None, roles: list[str] | None = None, path: str | None = None
+        self, *, methods: list[str] | None = None, roles: list[str] | None = None, path: str | None = None,
+        max_body_bytes: int | None = None,
     ) -> Callable[[Callable], Callable]:
         """`methods`/`roles` are RESTRICTIONS, applied only when given —
         never a required allowlist a caller must fill in just to get a
@@ -1228,6 +1280,16 @@ class RelayProvider:
             Guest access always needs an explicit `roles=["Guest"]` — never
             a fallback, whether from an omission or from authn happening to
             be absent.
+
+        `max_body_bytes=None` (default) -> this route shares the gateway-
+        wide `gateway_max_body_bytes` ceiling like every other endpoint.
+        Pass a value to give just this one route its own outer ASGI-level
+        body limit — e.g. filer's file_upload, which needs to accept much
+        larger requests than an ordinary JSON API call without raising the
+        shared ceiling everything else is bounded by (gateway/router.py's
+        own RouteEntry.max_body_bytes docstring has the full reasoning).
+        Fixed at decoration time, same as gateway_max_body_bytes itself is
+        fixed at boot — not a live-editable setting.
         """
         roles = roles if roles is not None else ["*"]
         methods = methods if methods is not None else list(ALL_METHODS)
@@ -1260,8 +1322,10 @@ class RelayProvider:
             wf = WhitelistedFunction(
                 name=name, plugin=plugin, fn=fn, methods=methods, roles=roles, path=derived_path,
                 wants_identity="identity" in sig.parameters, wants_client_ip="client_ip" in sig.parameters,
+                wants_cookies="cookies" in sig.parameters,
+                wants_request="request" in sig.parameters,
                 wants_dry_run="dry_run" in sig.parameters,
-                signature=sig,
+                signature=sig, max_body_bytes=max_body_bytes,
             )
             if wf.name in self._whitelisted:
                 raise RuntimeError(f"whitelisted function '{wf.name}' is already registered.")
@@ -1419,7 +1483,13 @@ class RelayProvider:
                     })
                 raise HTTPError(403, {"error": "forbidden", "detail": f"requires role(s) {wf.roles}"})
             try:
-                body = request.json() if request.body else {}
+                # wants_request functions get the raw Request instead (see
+                # WhitelistedFunction's own docstring) and parse their own
+                # body however they need to (e.g. request.form() for
+                # multipart) — attempting a JSON decode here first would
+                # 422 every such call before it ever reached its handler,
+                # since a multipart/form-data body is never valid JSON.
+                body = request.json() if request.body and not wf.wants_request else {}
             except Exception as exc:
                 raise HTTPError(422, {"error": "invalid JSON body", "detail": str(exc)}) from exc
             # A JSON body that decodes to a list/string/number/etc. isn't
@@ -1439,21 +1509,38 @@ class RelayProvider:
             # limitation — admin's Data Browser needed the same for JSON).
             kwargs: dict[str, Any] = {k: v[0] for k, v in request.query_params.items()}
             kwargs.update(body)
-            # GET is the one verb this system treats as safe/idempotent by
-            # convention — everything else (POST/PUT/PATCH/DELETE) is a
-            # real call, full stop. This signal is what makes an
-            # unrestricted-by-default write endpoint safe: it drives BOTH
-            # the injected `dry_run` kwarg below AND the _dry_run
-            # contextvar every arc.relay.save/save_many/delete/delete_many
-            # call already honors, regardless of whether wf.fn itself asked
-            # for the kwarg.
-            dry_run_signal = request.method == "GET"
+            # Path params (a `path="/files/{file_id}"`-style route) win
+            # over both — they're the most structural, least-spoofable
+            # part of the URL a caller controls, so a query string or body
+            # key of the same name must never be able to override what the
+            # route itself already matched. Every existing whitelisted
+            # function predates this (none used a `{param}` path before
+            # filer's file_download/serve_file), so this is purely
+            # additive — nothing that only ever used query_params/body
+            # sees any change here.
+            kwargs.update(request.path_params)
+            # GET and QUERY are the two verbs this system treats as
+            # safe/idempotent by convention — everything else (POST/PUT/
+            # PATCH/DELETE) is a real call, full stop. This signal is what
+            # makes an unrestricted-by-default write endpoint safe: it
+            # drives BOTH the injected `dry_run` kwarg below AND the
+            # _dry_run contextvar every arc.relay.save/save_many/delete/
+            # delete_many call already honors, regardless of whether wf.fn
+            # itself asked for the kwarg. QUERY exists specifically so a
+            # safe read can carry a real body (a GET physically cannot —
+            # every browser's fetch()/XHR throws synchronously if you try)
+            # without losing this same safety guarantee GET already has.
+            dry_run_signal = request.method in ("GET", "QUERY")
             if wf.wants_identity:
                 # Always the server-resolved identity, never a client-supplied
                 # "identity" key in the body — this overwrites it deliberately.
                 kwargs["identity"] = identity
             if wf.wants_client_ip:
                 kwargs["client_ip"] = getattr(request, "client_ip", None)
+            if wf.wants_cookies:
+                kwargs["cookies"] = getattr(request, "cookies", {})
+            if wf.wants_request:
+                kwargs["request"] = request
             if wf.wants_dry_run:
                 kwargs["dry_run"] = dry_run_signal
             try:
@@ -1504,6 +1591,20 @@ class RelayProvider:
                         _dry_run.reset(inner_token)
 
                 return StreamResponse(source=_dry_run_scoped(result))
+            if isinstance(result, StreamResponse):
+                # A whitelisted function that constructs its OWN
+                # gateway.request.StreamResponse directly (not via
+                # arc.relay.stream()) — e.g. filer's file_download,
+                # streaming bytes it already has an async iterator for,
+                # with no arc.relay.save/delete anywhere inside it to
+                # guard. Same "this is a live read, not a write" reasoning
+                # as the RelayStream branch above: pass it straight to
+                # Gateway's chunked-response path, never through the
+                # dry-run JSON-wrapping below, which assumes a single,
+                # already-complete, JSON-encodable value — wrapping a
+                # StreamResponse (an async generator) as `content` there
+                # would try to JSON-encode it and fail outright.
+                return result
             if dry_run_signal:
                 # Never let a dry-run response look indistinguishable from
                 # a real write's — a caller must be able to tell nothing
@@ -1516,7 +1617,9 @@ class RelayProvider:
             return result
 
         for method in wf.methods:
-            gateway.add_route(method, wf.path, handler, summary=f"whitelisted: {wf.name}")
+            gateway.add_route(
+                method, wf.path, handler, summary=f"whitelisted: {wf.name}", max_body_bytes=wf.max_body_bytes
+            )
 
     # ------------------------------------------------------------------ #
     # Cache / lock — genuinely redix-backed when redix is installed, and
