@@ -43,17 +43,19 @@ import importlib.util
 import inspect
 import logging
 import sys
-import time
+import time as time_module
+import types
+import typing
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 from uuid import UUID
 
 import arc  # safe at module level — same pattern gateway/request.py already uses;
-            # arc.codec is stateless and needs no active kernel to be imported
 
+# arc.codec is stateless and needs no active kernel to be imported
 from . import query
 from .resolvers import FieldResolver
 
@@ -83,6 +85,138 @@ HookEvent = Literal[
 ]
 PRECOMMIT_EVENTS = frozenset({"validate", "before_save", "after_save", "before_delete", "after_delete"})
 POSTCOMMIT_EVENTS = frozenset({"after_commit", "on_rollback"})
+
+# Injected by _wire_gateway_route itself (identity/client_ip/cookies/request/
+# dry_run) — never sourced from the caller's own query/body/path, so these
+# names are never candidates for the coercion/payload inspection below,
+# whatever a function happens to annotate them as.
+_INJECTED_PARAM_NAMES = frozenset({"identity", "client_ip", "cookies", "request", "dry_run"})
+
+# Every scalar type arc.codec (msgspec) can coerce a raw string into —
+# exactly what a query-string value always arrives as, since a URL has no
+# native number/boolean/date type at all (only text). A parameter typed as
+# one of these, or one of these wrapped in `| None`, gets its incoming
+# value coerced before `fn` is ever called (§1 P0 / "typed relay APIs") —
+# an untyped parameter, or one typed as something else entirely (dict,
+# list, Any, an arc.codec.Struct — see payload handling below), is left
+# completely untouched, exactly as before.
+_COERCIBLE_SCALAR_TYPES = (int, float, bool, str, UUID, date, datetime, time)
+
+
+def _coercible_type(annotation: Any) -> Any | None:
+    """The type to coerce this parameter's incoming value against, or None
+    if `annotation` isn't one this mechanism recognizes at all."""
+    if annotation is inspect.Parameter.empty:
+        return None
+    origin = typing.get_origin(annotation)
+    if origin is typing.Union or origin is types.UnionType:  # `X | None` / `Optional[X]`
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if len(args) == 1 and args[0] in _COERCIBLE_SCALAR_TYPES:
+            return annotation  # keep the full `X | None` shape — msgspec handles the union (incl. None) itself
+        return None
+    if annotation in _COERCIBLE_SCALAR_TYPES:
+        return annotation
+    return None
+
+
+def _is_struct_type(annotation: Any) -> bool:
+    return isinstance(annotation, type) and issubclass(annotation, arc.codec.Struct)
+
+
+def _inspect_whitelisted_signature(sig: inspect.Signature) -> tuple[dict[str, Any], Any, str | None]:
+    """Splits a whitelisted function's real (non-injected) parameters into
+    either: several coercible scalar params (param_types), OR exactly one
+    arc.codec.Struct-typed "payload" param (payload_type/payload_param) —
+    never both; see whitelist()'s own docstring for why mixing the two
+    styles isn't supported. A parameter that's neither (untyped, or an
+    annotation this mechanism doesn't recognize) is simply absent from
+    param_types and isn't a payload either — untouched, exactly as before
+    this feature existed."""
+    param_types: dict[str, Any] = {}
+    payload_type: Any = None
+    payload_param: str | None = None
+    for pname, param in sig.parameters.items():
+        if pname in _INJECTED_PARAM_NAMES:
+            continue
+        if _is_struct_type(param.annotation):
+            if payload_type is not None:
+                raise RuntimeError(
+                    f"whitelisted function has more than one arc.codec.Struct-typed "
+                    f"parameter ('{payload_param}' and '{pname}') — only one typed "
+                    f"payload parameter is supported per function."
+                )
+            payload_type = param.annotation
+            payload_param = pname
+            continue
+        coercible = _coercible_type(param.annotation)
+        if coercible is not None:
+            param_types[pname] = coercible
+    return param_types, payload_type, payload_param
+
+
+def _attach_server_timezone_if_naive(value: Any) -> Any:
+    """A `datetime` decoded with no explicit UTC offset in its source text
+    (e.g. "2026-10-10T14:30:00", vs. "...+05:30" or "...Z") comes back from
+    msgspec as naive — tzinfo=None, not "assume UTC". Left alone, asyncpg's
+    own encoder WOULD then assume UTC when writing it to a TIMESTAMPTZ
+    column (its default for a naive datetime), which is exactly the silent
+    hardcoded-UTC behavior arc.tz's whole point is to avoid. Attaching the
+    configured arc_server_timezone here — once, right after coercion — is
+    what makes a caller's naive "wall clock" input mean what the deployment
+    actually configured it to mean, consistently, everywhere downstream."""
+    if isinstance(value, datetime) and value.tzinfo is None:
+        return value.replace(tzinfo=arc.tz.server_timezone())
+    return value
+
+
+def _coerce_kwargs(wf: "WhitelistedFunction", kwargs: dict[str, Any]) -> None:
+    """Coerces kwargs in place against wf.param_types — every plain scalar
+    parameter whitelist() recognized at decoration time. A key not present
+    in kwargs (the caller simply didn't pass it — the function's own
+    default applies) is left alone; a key present but not coercible to its
+    annotated type raises arc.codec.CodecError naming the parameter, which
+    _wire_gateway_route turns into a 400. Fully opt-in and additive: a
+    function with no annotated parameters has an empty param_types and
+    this is a no-op, byte-for-byte the same request handling as before
+    this feature existed."""
+    for pname, ptype in wf.param_types.items():
+        if pname not in kwargs:
+            continue
+        try:
+            coerced = arc.codec.validate(kwargs[pname], type=ptype, strict=False)
+        except arc.codec.CodecError as exc:
+            raise arc.codec.CodecError(f"parameter '{pname}': {exc}") from exc
+        kwargs[pname] = _attach_server_timezone_if_naive(coerced)
+
+
+def _build_payload(wf: "WhitelistedFunction", kwargs: dict[str, Any]) -> Any:
+    """The opt-in "typed payload" style (§1 P1): a whitelisted function with
+    ONE arc.codec.Struct-typed parameter gets the WHOLE request (every
+    query/body/path key, minus the injected identity/client_ip/cookies/
+    request/dry_run ones — those stay their own separate kwargs, never
+    swept into the payload) decoded and validated against that Struct in
+    one shot, instead of coercing each field name individually. Raises
+    arc.codec.CodecError (caller turns it into a 400) naming exactly which
+    field is wrong, the same way msgspec already reports a bad Struct.
+
+    Known, deliberate limitation: only TOP-LEVEL datetime fields on the
+    Struct get the same naive-datetime-means-arc_server_timezone treatment
+    _coerce_kwargs's scalar path gets (via msgspec.structs.replace below) —
+    a naive datetime nested inside a Struct-typed FIELD of this Struct
+    would not. No whitelisted function in this codebase nests Structs like
+    that yet; revisit if one needs to."""
+    payload_source = {k: v for k, v in kwargs.items() if k not in _INJECTED_PARAM_NAMES}
+    payload = arc.codec.validate(payload_source, type=wf.payload_type, strict=False)
+
+    import msgspec
+
+    updates = {
+        f.name: _attach_server_timezone_if_naive(getattr(payload, f.name))
+        for f in msgspec.structs.fields(wf.payload_type)
+        if isinstance(getattr(payload, f.name), datetime) and getattr(payload, f.name).tzinfo is None
+    }
+    return msgspec.structs.replace(payload, **updates) if updates else payload
+
 
 _logger = logging.getLogger("relay")
 # "success" isn't a real stdlib logging level — mapped to INFO for dispatch,
@@ -297,6 +431,22 @@ class WhitelistedFunction:
                             # than recomputing inspect.signature(fn) per request
     max_body_bytes: int | None = None  # None -> gateway's own shared ceiling;
                                         # passed straight through to gateway.add_route()
+    param_types: dict[str, Any] = field(default_factory=dict)
+    # name -> annotation, for every plain parameter whitelist() recognized as
+    # coercible (int/float/bool/str/UUID/date/datetime/time, or one of those
+    # wrapped in `| None`) — computed once here, at decoration time, the same
+    # way signature/wants_* already are. A parameter with no annotation, or
+    # one this mechanism doesn't recognize (dict/list/Any, or an
+    # arc.codec.Struct — see payload_type below), is simply absent from this
+    # dict and stays completely untouched at request time, exactly as
+    # before: fully opt-in, nothing breaks for an existing function that
+    # never asked for this.
+    payload_type: Any = None
+    # The type of the ONE Struct-typed parameter, if this function chose the
+    # "typed payload" style instead of plain kwargs (see whitelist()'s own
+    # docstring) — None for every ordinary (plain-kwargs or untyped)
+    # function, which is unaffected by any of this.
+    payload_param: str | None = None
 
 
 # The ambient "current write's connection" — set only for the duration of a
@@ -1318,7 +1468,23 @@ class RelayProvider:
                 )
             name = f"{plugin}.{fn.__name__}"
             derived_path = path or f"/api/method/{name}"
-            sig = inspect.signature(fn)
+            # eval_str=True: many plugins write `from __future__ import
+            # annotations`, which makes every annotation a plain STRING
+            # (e.g. "int", not the type int) unless something evaluates it
+            # — needed here (unlike before this feature existed) because
+            # param_types/payload_type below actually inspect what the
+            # annotation IS, not just whether one exists. A string
+            # annotation is evaluated against fn's own MODULE globals
+            # (__globals__), never the local scope of whatever function
+            # happened to define it — a real trap for a whitelisted
+            # function nested inside another function with its own local
+            # `from datetime import datetime`-style import (verified
+            # directly: raises NameError at boot). Every real business
+            # plugin already avoids this naturally — register_api() loads
+            # each api/*.py file as its own module, and a normal top-level
+            # `import` there already lands in that module's globals.
+            sig = inspect.signature(fn, eval_str=True)
+            param_types, payload_type, payload_param = _inspect_whitelisted_signature(sig)
             wf = WhitelistedFunction(
                 name=name, plugin=plugin, fn=fn, methods=methods, roles=roles, path=derived_path,
                 wants_identity="identity" in sig.parameters, wants_client_ip="client_ip" in sig.parameters,
@@ -1326,6 +1492,7 @@ class RelayProvider:
                 wants_request="request" in sig.parameters,
                 wants_dry_run="dry_run" in sig.parameters,
                 signature=sig, max_body_bytes=max_body_bytes,
+                param_types=param_types, payload_type=payload_type, payload_param=payload_param,
             )
             if wf.name in self._whitelisted:
                 raise RuntimeError(f"whitelisted function '{wf.name}' is already registered.")
@@ -1504,9 +1671,9 @@ class RelayProvider:
             # query params alone, and an existing POST-only caller sees no
             # change at all (it never had query params to begin with).
             # First value per key only (request.query() already does the
-            # same); no type coercion beyond what's already the norm for
-            # any string-arriving-over-HTTP arg (docs' own known
-            # limitation — admin's Data Browser needed the same for JSON).
+            # same). Coercion against each param's own annotation happens
+            # below, once every source (query/body/path/injected) has been
+            # merged — see wf.param_types / _coerce_kwargs.
             kwargs: dict[str, Any] = {k: v[0] for k, v in request.query_params.items()}
             kwargs.update(body)
             # Path params (a `path="/files/{file_id}"`-style route) win
@@ -1543,6 +1710,31 @@ class RelayProvider:
                 kwargs["request"] = request
             if wf.wants_dry_run:
                 kwargs["dry_run"] = dry_run_signal
+            if wf.payload_type is not None:
+                # Opt-in "typed payload" style (§1 P1) — the whole request
+                # becomes ONE validated Struct instead of several
+                # individually-coerced kwargs; reshape kwargs down to just
+                # {payload_param: <Struct>, **whatever injected kwargs this
+                # function also asked for} so the bind()/call below see
+                # exactly wf.fn's real parameter list either way.
+                try:
+                    payload = _build_payload(wf, kwargs)
+                except arc.codec.CodecError as exc:
+                    raise HTTPError(400, {"error": "invalid arguments", "detail": str(exc)}) from exc
+                kwargs = {
+                    wf.payload_param: payload,
+                    **{k: v for k, v in kwargs.items() if k in _INJECTED_PARAM_NAMES},
+                }
+            else:
+                try:
+                    # Coerce each param_types entry (§1 P0) BEFORE bind()
+                    # below — a bad value is a 400 naming the parameter,
+                    # from here, not a TypeError from bind() (wrong
+                    # arity/name only, blind to types) or a 500 from deep
+                    # inside wf.fn.
+                    _coerce_kwargs(wf, kwargs)
+                except arc.codec.CodecError as exc:
+                    raise HTTPError(400, {"error": "invalid arguments", "detail": str(exc)}) from exc
             try:
                 # Bind (never call) against the real signature first — this
                 # is where a body with missing/unexpected/mistyped keys
@@ -1650,7 +1842,7 @@ class RelayProvider:
         if entry is None:
             return None
         value, expires_at = entry
-        if expires_at is not None and time.monotonic() >= expires_at:
+        if expires_at is not None and time_module.monotonic() >= expires_at:
             self._local_cache.pop(key, None)
             return None
         return value
@@ -1664,9 +1856,9 @@ class RelayProvider:
         # unreferenced one can be GC-cancelled and the key then never
         # expires). Setting also sweeps any already-expired entries so the
         # fallback dict can't grow unboundedly on write-once keys.
-        self._local_cache[key] = (value, time.monotonic() + ex if ex is not None else None)
+        self._local_cache[key] = (value, time_module.monotonic() + ex if ex is not None else None)
         if len(self._local_cache) % 256 == 0:
-            now = time.monotonic()
+            now = time_module.monotonic()
             for k in [k for k, (_v, exp) in self._local_cache.items() if exp is not None and now >= exp]:
                 self._local_cache.pop(k, None)
 
