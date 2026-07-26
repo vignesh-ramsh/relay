@@ -30,7 +30,9 @@ err_console = Console(stderr=True, style="bold red")
 @app.command(name="prune-job-log")
 def prune_job_log_cmd(
     older_than_days: int = typer.Option(
-        DEFAULT_RETENTION_DAYS, "--older-than-days", help="Delete _job_log rows finished before this many days ago."
+        DEFAULT_RETENTION_DAYS,
+        "--older-than-days",
+        help="Delete _job_log rows finished before this many days ago.",
     ),
     yes: bool = typer.Option(False, "--yes", help="Skip the confirmation prompt."),
 ) -> None:

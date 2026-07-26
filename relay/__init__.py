@@ -61,6 +61,12 @@ from .resolvers import FieldResolver
 
 CAPABILITY = "relay"
 
+# list()'s default cap (§9/§3 — the doc's own "the day a 2M-row table meets
+# a UI that forgot `limit`" scenario). Callers that genuinely need
+# everything pass limit=None explicitly — the escape hatch stays, it's
+# just no longer the silent default.
+DEFAULT_LIST_LIMIT = 1000
+
 # The concrete verb set a whitelisted function registers when `methods` is
 # left unspecified (docs: methods is a RESTRICTION when given, not a
 # required allowlist — the function body, plus dry_run below, decides the
@@ -79,11 +85,17 @@ CAPABILITY = "relay"
 ALL_METHODS = ("GET", "QUERY", "POST", "PUT", "PATCH", "DELETE")
 
 HookEvent = Literal[
-    "validate", "before_save", "after_save",
-    "before_delete", "after_delete",
-    "after_commit", "on_rollback",
+    "validate",
+    "before_save",
+    "after_save",
+    "before_delete",
+    "after_delete",
+    "after_commit",
+    "on_rollback",
 ]
-PRECOMMIT_EVENTS = frozenset({"validate", "before_save", "after_save", "before_delete", "after_delete"})
+PRECOMMIT_EVENTS = frozenset(
+    {"validate", "before_save", "after_save", "before_delete", "after_delete"}
+)
 POSTCOMMIT_EVENTS = frozenset({"after_commit", "on_rollback"})
 
 # Injected by _wire_gateway_route itself (identity/client_ip/cookies/request/
@@ -123,7 +135,9 @@ def _is_struct_type(annotation: Any) -> bool:
     return isinstance(annotation, type) and issubclass(annotation, arc.codec.Struct)
 
 
-def _inspect_whitelisted_signature(sig: inspect.Signature) -> tuple[dict[str, Any], Any, str | None]:
+def _inspect_whitelisted_signature(
+    sig: inspect.Signature,
+) -> tuple[dict[str, Any], Any, str | None]:
     """Splits a whitelisted function's real (non-injected) parameters into
     either: several coercible scalar params (param_types), OR exactly one
     arc.codec.Struct-typed "payload" param (payload_type/payload_param) —
@@ -213,7 +227,8 @@ def _build_payload(wf: "WhitelistedFunction", kwargs: dict[str, Any]) -> Any:
     updates = {
         f.name: _attach_server_timezone_if_naive(getattr(payload, f.name))
         for f in msgspec.structs.fields(wf.payload_type)
-        if isinstance(getattr(payload, f.name), datetime) and getattr(payload, f.name).tzinfo is None
+        if isinstance(getattr(payload, f.name), datetime)
+        and getattr(payload, f.name).tzinfo is None
     }
     return msgspec.structs.replace(payload, **updates) if updates else payload
 
@@ -224,8 +239,10 @@ _logger = logging.getLogger("relay")
 # record.relay_level when present) so a caller's own info/success/warning/
 # error vocabulary survives into structured logs, not just console text.
 _LOG_LEVELS = {
-    "info": logging.INFO, "success": logging.INFO,
-    "warning": logging.WARNING, "error": logging.ERROR,
+    "info": logging.INFO,
+    "success": logging.INFO,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
 }
 
 
@@ -265,9 +282,13 @@ class Doc:
     rather than silently doing nothing.
     """
 
-    def __init__(self, *, base: dict, overlay: dict | None, old: "Doc | None", is_new: bool) -> None:
+    def __init__(
+        self, *, base: dict, overlay: dict | None, old: "Doc | None", is_new: bool
+    ) -> None:
         object.__setattr__(self, "_base", base)
-        object.__setattr__(self, "_overlay", overlay)  # ctx.payload while writable, else None (read-only)
+        object.__setattr__(
+            self, "_overlay", overlay
+        )  # ctx.payload while writable, else None (read-only)
         object.__setattr__(self, "old", old)
         object.__setattr__(self, "_is_new", is_new)
 
@@ -330,7 +351,9 @@ def _old_doc(old: dict | None) -> Doc | None:
 
 def _precommit_doc(old: dict | None, payload: dict, *, is_new: bool) -> Doc:
     """validate/before_save's live, writable, old-overlaid-with-payload view."""
-    return Doc(base=dict(old) if old is not None else {}, overlay=payload, old=_old_doc(old), is_new=is_new)
+    return Doc(
+        base=dict(old) if old is not None else {}, overlay=payload, old=_old_doc(old), is_new=is_new
+    )
 
 
 def _postwrite_doc(new: dict | None, old_doc: Doc | None, *, is_new: bool) -> Doc:
@@ -359,6 +382,7 @@ class HookContext:
     written, since it's the same dict insert()/update() is called with
     afterward (and doc.fieldname = value is sugar for exactly that same
     mutation — see Doc's docstring)."""
+
     table: str
     old: dict | None = None
     payload: dict = field(default_factory=dict)
@@ -405,7 +429,8 @@ class WhitelistedFunction:
     represent an uploaded file's bytes at all). Every other whitelisted
     function keeps working exactly as before without knowing this exists,
     same as every wants_* flag above."""
-    name: str            # "<plugin>.<function_name>" — also arc.relay.call()'s key
+
+    name: str  # "<plugin>.<function_name>" — also arc.relay.call()'s key
     plugin: str
     fn: Callable[..., Awaitable[Any]]
     methods: list[str]
@@ -416,21 +441,21 @@ class WhitelistedFunction:
     wants_cookies: bool = False
     wants_request: bool = False
     wants_dry_run: bool = False  # same mechanism, mirrored, for a function that
-                                  # declares a `dry_run` parameter — True whenever
-                                  # the inbound request used a safe/idempotent verb
-                                  # (today: GET) against a write-capable endpoint.
-                                  # Purely informational for the function's OWN
-                                  # non-relay side effects (mail, enqueue, ...) —
-                                  # the REAL enforcement for arc.relay.save/delete
-                                  # is the _dry_run contextvar below, active
-                                  # regardless of whether the function asked for
-                                  # this kwarg at all.
+    # declares a `dry_run` parameter — True whenever
+    # the inbound request used a safe/idempotent verb
+    # (today: GET) against a write-capable endpoint.
+    # Purely informational for the function's OWN
+    # non-relay side effects (mail, enqueue, ...) —
+    # the REAL enforcement for arc.relay.save/delete
+    # is the _dry_run contextvar below, active
+    # regardless of whether the function asked for
+    # this kwarg at all.
     signature: Any = None  # inspect.Signature, computed once at decoration time —
-                            # _wire_gateway_route uses signature.bind() to reject a
-                            # malformed body as a 400 before ever calling fn, rather
-                            # than recomputing inspect.signature(fn) per request
+    # _wire_gateway_route uses signature.bind() to reject a
+    # malformed body as a 400 before ever calling fn, rather
+    # than recomputing inspect.signature(fn) per request
     max_body_bytes: int | None = None  # None -> gateway's own shared ceiling;
-                                        # passed straight through to gateway.add_route()
+    # passed straight through to gateway.add_route()
     param_types: dict[str, Any] = field(default_factory=dict)
     # name -> annotation, for every plain parameter whitelist() recognized as
     # coercible (int/float/bool/str/UUID/date/datetime/time, or one of those
@@ -480,7 +505,9 @@ _dry_run: ContextVar[bool] = ContextVar("arc_relay_dry_run", default=False)
 # plumbing. None (the default) means "no stream is currently active" —
 # publish() treats that as "nobody's listening" and is a silent no-op,
 # never an error.
-_active_stream: ContextVar["asyncio.Queue | None"] = ContextVar("arc_relay_active_stream", default=None)
+_active_stream: ContextVar["asyncio.Queue | None"] = ContextVar(
+    "arc_relay_active_stream", default=None
+)
 
 
 class RelayStream:
@@ -529,7 +556,9 @@ class RelayProvider:
     HookContext = HookContext
     WhitelistedFunction = WhitelistedFunction
     Doc = Doc
-    QueryError = query.QueryError  # get/list/count/aggregate/save's "bad filter/field/operator" error — see relay.query
+    QueryError = (
+        query.QueryError
+    )  # get/list/count/aggregate/save's "bad filter/field/operator" error — see relay.query
 
     def __init__(self, kernel: Any) -> None:
         self._kernel = kernel
@@ -564,7 +593,9 @@ class RelayProvider:
     # filename-to-table convention as schemas/patches (psqldb.model).
     # ------------------------------------------------------------------ #
     def register_hooks(self, hooks_dir: str | Path) -> None:
-        from psqldb.model import slugify_table_name  # only dependency Relay takes on psqldb's internals
+        from psqldb.model import (
+            slugify_table_name,
+        )  # only dependency Relay takes on psqldb's internals
 
         hooks_dir = Path(hooks_dir)
         if not hooks_dir.exists():
@@ -585,7 +616,9 @@ class RelayProvider:
                 spec = importlib.util.spec_from_file_location(module_name, path)
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = module  # standard module_from_spec usage — also lets
-                spec.loader.exec_module(module)    # a hook file's own internals (dataclasses, etc.) resolve correctly
+                spec.loader.exec_module(
+                    module
+                )  # a hook file's own internals (dataclasses, etc.) resolve correctly
             finally:
                 self._loading_table = None
                 self._loading_plugin = None
@@ -604,6 +637,7 @@ class RelayProvider:
                     f"loaded via arc.relay.register_hooks()."
                 )
             return self.add_hook(self._loading_table, event, fn)
+
         return decorator
 
     @property
@@ -729,7 +763,9 @@ class RelayProvider:
     # Not kept as deprecated aliases: this project carries no version
     # number and no back-compat promise yet (docs/arc.MD §1).
     # ------------------------------------------------------------------ #
-    async def _insert(self, table: str, data: dict, *, by: str | None = None, new_transaction: bool = False) -> dict:
+    async def _insert(
+        self, table: str, data: dict, *, by: str | None = None, new_transaction: bool = False
+    ) -> dict:
         self._psqldb.schema(table)  # SchemaError early if unknown, before opening anything
         ctx = HookContext(table=table, old=None, payload=dict(data))
         ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
@@ -741,7 +777,7 @@ class RelayProvider:
                     await self._run_hooks(table, "validate", ctx)
                     await self._run_hooks(table, "before_save", ctx)
                     row = await self._psqldb.insert(table, ctx.payload, created_by=by, conn=conn)
-                    ctx.new = dict(row)
+                    ctx.new = row  # psqldb.insert() already returns a plain dict
                     ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
                     await self._run_hooks(table, "after_save", ctx)
             except Exception as exc:
@@ -755,7 +791,13 @@ class RelayProvider:
         return ctx.new
 
     async def _update(
-        self, table: str, id: UUID, data: dict, *, by: str | None = None, new_transaction: bool = False
+        self,
+        table: str,
+        id: UUID,
+        data: dict,
+        *,
+        by: str | None = None,
+        new_transaction: bool = False,
     ) -> dict | None:
         self._psqldb.schema(table)
         ctx = HookContext(table=table, payload=dict(data))
@@ -765,13 +807,15 @@ class RelayProvider:
                 async with self._transaction_or_dry_run(conn, dry_run):
                     ctx.conn = conn
                     if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
-                        old_row = await self._psqldb.get(table, id, conn=conn)
-                        ctx.old = dict(old_row) if old_row else None
+                        # psqldb.get() already returns a plain dict (or None)
+                        ctx.old = await self._psqldb.get(table, id, conn=conn)
                     ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
                     await self._run_hooks(table, "validate", ctx)
                     await self._run_hooks(table, "before_save", ctx)
-                    row = await self._psqldb.update(table, id, ctx.payload, updated_by=by, conn=conn)
-                    ctx.new = dict(row) if row else None
+                    # psqldb.update() already returns a plain dict (or None)
+                    ctx.new = await self._psqldb.update(
+                        table, id, ctx.payload, updated_by=by, conn=conn
+                    )
                     ctx.doc = _postwrite_doc(ctx.new, ctx.doc.old, is_new=False)
                     await self._run_hooks(table, "after_save", ctx)
             except Exception as exc:
@@ -818,7 +862,9 @@ class RelayProvider:
         """
         if data.get("id") is not None:
             payload = {k: v for k, v in data.items() if k != "id"}
-            updated = await self._update(table, data["id"], payload, by=by, new_transaction=new_transaction)
+            updated = await self._update(
+                table, data["id"], payload, by=by, new_transaction=new_transaction
+            )
             if updated is None:
                 raise query.QueryError(
                     f"save(): no row on '{table}' with id {data['id']!r} — an explicit id "
@@ -856,7 +902,9 @@ class RelayProvider:
         payload = {k: v for k, v in data.items() if k != "id"}
         return await self._insert(table, payload, by=by, new_transaction=new_transaction)
 
-    async def delete(self, table: str, id: UUID, *, by: str | None = None, new_transaction: bool = False) -> None:
+    async def delete(
+        self, table: str, id: UUID, *, by: str | None = None, new_transaction: bool = False
+    ) -> None:
         self._psqldb.schema(table)
         ctx = HookContext(table=table)
         dry_run = _dry_run.get()
@@ -865,8 +913,8 @@ class RelayProvider:
                 async with self._transaction_or_dry_run(conn, dry_run):
                     ctx.conn = conn
                     if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
-                        old_row = await self._psqldb.get(table, id, conn=conn)
-                        ctx.old = dict(old_row) if old_row else None
+                        # psqldb.get() already returns a plain dict (or None)
+                        ctx.old = await self._psqldb.get(table, id, conn=conn)
                     ctx.doc = _delete_doc(ctx.old)
                     await self._run_hooks(table, "before_delete", ctx)
                     await self._psqldb.soft_delete(table, id, deleted_by=by, conn=conn)
@@ -909,7 +957,13 @@ class RelayProvider:
         self._psqldb.schema(table)  # SchemaError early if unknown, before building anything
         filters = key if isinstance(key, dict) else {"id": key}
         rows = await self._select(
-            table, filters=filters, fields=fields, order_by=None, limit=1, offset=0, distinct=False,
+            table,
+            filters=filters,
+            fields=fields,
+            order_by=None,
+            limit=1,
+            offset=0,
+            distinct=False,
             new_transaction=new_transaction,
         )
         return rows[0] if rows else None
@@ -921,20 +975,27 @@ class RelayProvider:
         filters: dict[str, Any] | None = None,
         fields: list[str | query.Resolve | FieldResolver] | None = None,
         order_by: list[str] | None = None,
-        limit: int | None = None,
+        limit: int | None = DEFAULT_LIST_LIMIT,
         offset: int = 0,
         distinct: bool = False,
         new_transaction: bool = False,
     ) -> list[dict]:
-        """Multiple rows. `limit=None` (the default) fetches everything that
-        matches `filters` — no implicit cap. That's a deliberate choice, not
-        an oversight: pass an explicit `limit` for anything user-facing
-        where an unbounded result would be a real problem; the engine won't
-        make that call for you."""
+        """Multiple rows, capped at DEFAULT_LIST_LIMIT (1000) unless told
+        otherwise — protects the caller's future self from the day a table
+        that used to be small enough to fetch whole isn't anymore. Pass an
+        explicit `limit` to change the cap, or `limit=None` to mean it
+        literally: fetch everything that matches `filters`, no cap at all —
+        still available, just no longer the default."""
         self._psqldb.schema(table)
         return await self._select(
-            table, filters=filters, fields=fields, order_by=order_by, limit=limit, offset=offset,
-            distinct=distinct, new_transaction=new_transaction,
+            table,
+            filters=filters,
+            fields=fields,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+            distinct=distinct,
+            new_transaction=new_transaction,
         )
 
     async def _select(
@@ -951,8 +1012,16 @@ class RelayProvider:
     ) -> list[dict]:
         schema = self._psqldb.schema(table)
         sql, params = query.build_select(
-            table, schema, filters=filters, fields=fields, order_by=order_by, limit=limit, offset=offset,
-            distinct=distinct, ref_columns=self._psqldb.ref_columns(), schema_lookup=self._psqldb.schema,
+            table,
+            schema,
+            filters=filters,
+            fields=fields,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+            distinct=distinct,
+            ref_columns=self._psqldb.ref_columns(),
+            schema_lookup=self._psqldb.schema,
         )
         async with self._connection(new_transaction=new_transaction) as conn:
             rows = await conn.fetch(sql, *params)
@@ -984,7 +1053,9 @@ class RelayProvider:
         return out
 
     @staticmethod
-    async def _resolve_fields(rows: list[dict], fields: list[str | query.Resolve | FieldResolver]) -> None:
+    async def _resolve_fields(
+        rows: list[dict], fields: list[str | query.Resolve | FieldResolver]
+    ) -> None:
         """Applies every FieldResolver marker in `fields`, in place. Each
         resolver's prepare() runs exactly ONCE per query — regardless of
         row count — with every row's raw value for its field already
@@ -999,11 +1070,78 @@ class RelayProvider:
             for row in rows:
                 row[item.field] = item.resolve(row[item.field], context)
 
-    async def count(self, table: str, *, filters: dict[str, Any] | None = None, new_transaction: bool = False) -> int:
+    async def count(
+        self, table: str, *, filters: dict[str, Any] | None = None, new_transaction: bool = False
+    ) -> int:
         schema = self._psqldb.schema(table)
-        sql, params = query.build_count(table, schema, filters=filters, ref_columns=self._psqldb.ref_columns())
+        sql, params = query.build_count(
+            table, schema, filters=filters, ref_columns=self._psqldb.ref_columns()
+        )
         async with self._connection(new_transaction=new_transaction) as conn:
             return await conn.fetchval(sql, *params)
+
+    async def list_page(
+        self,
+        table: str,
+        *,
+        filters: dict[str, Any] | None = None,
+        fields: list[str | query.Resolve | FieldResolver] | None = None,
+        order_by: list[str] | None = None,
+        limit: int | None = DEFAULT_LIST_LIMIT,
+        offset: int = 0,
+        distinct: bool = False,
+        new_transaction: bool = False,
+    ) -> tuple[list[dict], int]:
+        """(rows, total) — the same rows list() would return for these
+        exact arguments, plus a total count of every row matching
+        `filters` regardless of limit/offset, so a caller can tell "is
+        there more" without a second, separately-written count() call
+        (and without the two ever silently drifting out of sync on
+        filters, since both are built from the same `filters` here).
+
+        Deliberately NOT a dict with fixed key names like {"rows": ...,
+        "total": ...} — that would be dictating an HTTP response envelope
+        from inside a plain data-access method, which isn't this layer's
+        job; list()/count()/aggregate() return plain data with no opinion
+        about wire shape either, and this stays consistent with them. The
+        caller (a whitelisted function, usually) decides what its own
+        response actually looks like.
+
+        Also deliberately not "the" pagination mechanism — this is the
+        OFFSET+total convenience specifically. A caller that wants
+        cursor-based paging (no COUNT(*) at all — cheaper and more
+        consistent under concurrent writes at real scale) already has
+        everything it needs in plain list() + filters + order_by (e.g.
+        filters={"id": {"gt": last_seen_id}}); it never needs this method.
+
+        Runs both queries on ONE shared connection rather than two
+        separate pool checkouts (still two queries, not one round-trip —
+        no SELECT ... count(*) OVER() window-function trick here; revisit
+        only if profiling ever shows the extra round-trip actually
+        matters)."""
+        schema = self._psqldb.schema(table)
+        select_sql, select_params = query.build_select(
+            table,
+            schema,
+            filters=filters,
+            fields=fields,
+            order_by=order_by,
+            limit=limit,
+            offset=offset,
+            distinct=distinct,
+            ref_columns=self._psqldb.ref_columns(),
+            schema_lookup=self._psqldb.schema,
+        )
+        count_sql, count_params = query.build_count(
+            table, schema, filters=filters, ref_columns=self._psqldb.ref_columns()
+        )
+        async with self._connection(new_transaction=new_transaction) as conn:
+            rows = await conn.fetch(select_sql, *select_params)
+            total = await conn.fetchval(count_sql, *count_params)
+        shaped = [self._shape_row(dict(r), fields) for r in rows]
+        if fields:
+            await self._resolve_fields(shaped, fields)
+        return shaped, total
 
     async def aggregate(
         self,
@@ -1020,7 +1158,11 @@ class RelayProvider:
         group. No HAVING, no resolve() — see query.py's module docstring."""
         schema = self._psqldb.schema(table)
         sql, params = query.build_aggregate(
-            table, schema, group_by=group_by, aggregates=aggregates, filters=filters,
+            table,
+            schema,
+            group_by=group_by,
+            aggregates=aggregates,
+            filters=filters,
             ref_columns=self._psqldb.ref_columns(),
         )
         async with self._connection(new_transaction=new_transaction) as conn:
@@ -1046,7 +1188,9 @@ class RelayProvider:
             rows = await conn.fetch(statement, *params)
         return [dict(r) for r in rows]
 
-    async def sql_one(self, statement: str, *params: Any, new_transaction: bool = False) -> dict | None:
+    async def sql_one(
+        self, statement: str, *params: Any, new_transaction: bool = False
+    ) -> dict | None:
         async with self._connection(new_transaction=new_transaction) as conn:
             row = await conn.fetchrow(statement, *params)
         return dict(row) if row else None
@@ -1092,7 +1236,7 @@ class RelayProvider:
                         table, [ctx.payload for ctx in ctxs], created_by=by, conn=conn
                     )
                     for ctx, row in zip(ctxs, results):
-                        ctx.new = dict(row)
+                        ctx.new = row  # psqldb.insert_many() already returns plain dicts
                         ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
                     for ctx in ctxs:
                         await self._run_hooks(table, "after_save", ctx)
@@ -1110,7 +1254,12 @@ class RelayProvider:
         return [ctx.new for ctx in ctxs]
 
     async def _update_many(
-        self, table: str, updates: list[dict], *, by: str | None = None, new_transaction: bool = False
+        self,
+        table: str,
+        updates: list[dict],
+        *,
+        by: str | None = None,
+        new_transaction: bool = False,
     ) -> list[dict]:
         """`updates` is `[{"id": ..., "data": {...}}, ...]`."""
         self._psqldb.schema(table)
@@ -1125,7 +1274,8 @@ class RelayProvider:
                 async with self._transaction_or_dry_run(conn, dry_run):
                     if need_old:
                         old_rows = await self._psqldb.get_many(table, ids, conn=conn)
-                        old_by_id = {r["id"]: dict(r) for r in old_rows}
+                        # psqldb.get_many() already returns plain dicts
+                        old_by_id = {r["id"]: r for r in old_rows}
                         for ctx, row_id in zip(ctxs, ids):
                             ctx.old = old_by_id.get(row_id)
                     for ctx in ctxs:
@@ -1137,9 +1287,11 @@ class RelayProvider:
                     results = await self._psqldb.update_many(
                         table,
                         [{"id": row_id, "data": ctx.payload} for row_id, ctx in zip(ids, ctxs)],
-                        updated_by=by, conn=conn,
+                        updated_by=by,
+                        conn=conn,
                     )
-                    results_by_id = {r["id"]: dict(r) for r in results}
+                    # psqldb.update_many() already returns plain dicts
+                    results_by_id = {r["id"]: r for r in results}
                     for ctx, row_id in zip(ctxs, ids):
                         ctx.new = results_by_id.get(row_id)
                         ctx.doc = _postwrite_doc(ctx.new, ctx.doc.old, is_new=False)
@@ -1198,14 +1350,21 @@ class RelayProvider:
                     for row in rows:
                         row_id = row.get("id")
                         if row_id is not None:
-                            resolved.append(("update", row_id, {k: v for k, v in row.items() if k != "id"}))
+                            resolved.append(
+                                ("update", row_id, {k: v for k, v in row.items() if k != "id"})
+                            )
                             continue
                         if match_on:
                             filters = {f: row[f] for f in match_on}
                             cap = (limit + 1) if limit is not None else None
                             matches = await self._select(
-                                table, filters=filters, fields=["id"], order_by=None,
-                                limit=cap, offset=0, distinct=False,
+                                table,
+                                filters=filters,
+                                fields=["id"],
+                                order_by=None,
+                                limit=cap,
+                                offset=0,
+                                distinct=False,
                             )
                             if limit is not None and len(matches) > limit:
                                 raise query.QueryError(
@@ -1217,21 +1376,28 @@ class RelayProvider:
                                 for m in matches:
                                     resolved.append(("update", m["id"], data))
                                 continue
-                        resolved.append(("insert", None, {k: v for k, v in row.items() if k != "id"}))
+                        resolved.append(
+                            ("insert", None, {k: v for k, v in row.items() if k != "id"})
+                        )
 
                     for kind, _rid, data in resolved:
                         if kind == "insert":
                             ctx = HookContext(table=table, old=None, payload=dict(data))
                             ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
                             insert_ctxs.append(ctx)
-                    update_targets = [(rid, data) for kind, rid, data in resolved if kind == "update"]
+                    update_targets = [
+                        (rid, data) for kind, rid, data in resolved if kind == "update"
+                    ]
                     for _rid, data in update_targets:
                         update_ctxs.append(HookContext(table=table, payload=dict(data)))
 
                     need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
                     if need_old and update_targets:
-                        old_rows = await self._psqldb.get_many(table, [rid for rid, _ in update_targets], conn=conn)
-                        old_by_id = {r["id"]: dict(r) for r in old_rows}
+                        old_rows = await self._psqldb.get_many(
+                            table, [rid for rid, _ in update_targets], conn=conn
+                        )
+                        # psqldb.get_many() already returns plain dicts
+                        old_by_id = {r["id"]: r for r in old_rows}
                         for ctx, (rid, _data) in zip(update_ctxs, update_targets):
                             ctx.old = old_by_id.get(rid)
                     for ctx in update_ctxs:
@@ -1247,16 +1413,22 @@ class RelayProvider:
                         results = await self._psqldb.insert_many(
                             table, [c.payload for c in insert_ctxs], created_by=by, conn=conn
                         )
+                        # psqldb.insert_many() already returns plain dicts
                         for c, r in zip(insert_ctxs, results):
-                            c.new = dict(r)
+                            c.new = r
                             c.doc = _postwrite_doc(c.new, None, is_new=True)
                     if update_ctxs:
                         results = await self._psqldb.update_many(
                             table,
-                            [{"id": rid, "data": c.payload} for (rid, _d), c in zip(update_targets, update_ctxs)],
-                            updated_by=by, conn=conn,
+                            [
+                                {"id": rid, "data": c.payload}
+                                for (rid, _d), c in zip(update_targets, update_ctxs)
+                            ],
+                            updated_by=by,
+                            conn=conn,
                         )
-                        results_by_id = {r["id"]: dict(r) for r in results}
+                        # psqldb.update_many() already returns plain dicts
+                        results_by_id = {r["id"]: r for r in results}
                         for (rid, _d), c in zip(update_targets, update_ctxs):
                             c.new = results_by_id.get(rid)
                             c.doc = _postwrite_doc(c.new, c.doc.old, is_new=False)
@@ -1290,7 +1462,8 @@ class RelayProvider:
                 async with self._transaction_or_dry_run(conn, dry_run):
                     if need_old:
                         old_rows = await self._psqldb.get_many(table, ids, conn=conn)
-                        old_by_id = {r["id"]: dict(r) for r in old_rows}
+                        # psqldb.get_many() already returns plain dicts
+                        old_by_id = {r["id"]: r for r in old_rows}
                         for ctx, row_id in zip(ctxs, ids):
                             ctx.old = old_by_id.get(row_id)
                     for ctx in ctxs:
@@ -1411,7 +1584,11 @@ class RelayProvider:
         return decorator
 
     def whitelist(
-        self, *, methods: list[str] | None = None, roles: list[str] | None = None, path: str | None = None,
+        self,
+        *,
+        methods: list[str] | None = None,
+        roles: list[str] | None = None,
+        path: str | None = None,
         max_body_bytes: int | None = None,
     ) -> Callable[[Callable], Callable]:
         """`methods`/`roles` are RESTRICTIONS, applied only when given —
@@ -1486,13 +1663,22 @@ class RelayProvider:
             sig = inspect.signature(fn, eval_str=True)
             param_types, payload_type, payload_param = _inspect_whitelisted_signature(sig)
             wf = WhitelistedFunction(
-                name=name, plugin=plugin, fn=fn, methods=methods, roles=roles, path=derived_path,
-                wants_identity="identity" in sig.parameters, wants_client_ip="client_ip" in sig.parameters,
+                name=name,
+                plugin=plugin,
+                fn=fn,
+                methods=methods,
+                roles=roles,
+                path=derived_path,
+                wants_identity="identity" in sig.parameters,
+                wants_client_ip="client_ip" in sig.parameters,
                 wants_cookies="cookies" in sig.parameters,
                 wants_request="request" in sig.parameters,
                 wants_dry_run="dry_run" in sig.parameters,
-                signature=sig, max_body_bytes=max_body_bytes,
-                param_types=param_types, payload_type=payload_type, payload_param=payload_param,
+                signature=sig,
+                max_body_bytes=max_body_bytes,
+                param_types=param_types,
+                payload_type=payload_type,
+                payload_param=payload_param,
             )
             if wf.name in self._whitelisted:
                 raise RuntimeError(f"whitelisted function '{wf.name}' is already registered.")
@@ -1513,7 +1699,9 @@ class RelayProvider:
         boundary a request actually crosses (see _wire_gateway_route)."""
         wf = self._whitelisted.get(name)
         if wf is None:
-            raise RelayError(f"no whitelisted function named '{name}'", status=404, code="not_found")
+            raise RelayError(
+                f"no whitelisted function named '{name}'", status=404, code="not_found"
+            )
         result = await wf.fn(**kwargs)
         if isinstance(result, RelayStream):
             # No open HTTP connection exists here to push chunks down (this
@@ -1572,7 +1760,9 @@ class RelayProvider:
             get_next = asyncio.ensure_future(queue.get())
             try:
                 while True:
-                    done, _pending = await asyncio.wait({get_next, task}, return_when=asyncio.FIRST_COMPLETED)
+                    done, _pending = await asyncio.wait(
+                        {get_next, task}, return_when=asyncio.FIRST_COMPLETED
+                    )
                     if get_next in done:
                         yield get_next.result()
                         get_next = asyncio.ensure_future(queue.get())
@@ -1607,7 +1797,11 @@ class RelayProvider:
 
     def _wire_gateway_route(self, wf: WhitelistedFunction) -> None:
         gateway = self._kernel.get("gateway")
-        from gateway.request import HTTPError, Response, StreamResponse  # only imported when gateway is actually present
+        from gateway.request import (
+            HTTPError,
+            Response,
+            StreamResponse,
+        )  # only imported when gateway is actually present
 
         async def handler(request: Any) -> Any:
             # request.identity is None whenever authn isn't installed, or a
@@ -1644,11 +1838,16 @@ class RelayProvider:
                     # the caller didn't lack a role, there's structurally no
                     # way for ANY caller to ever satisfy this endpoint right
                     # now, because nothing can authenticate anyone.
-                    raise HTTPError(403, {
-                        "error": "forbidden",
-                        "detail": "authentication is required for this endpoint, but no authn plugin is installed",
-                    })
-                raise HTTPError(403, {"error": "forbidden", "detail": f"requires role(s) {wf.roles}"})
+                    raise HTTPError(
+                        403,
+                        {
+                            "error": "forbidden",
+                            "detail": "authentication is required for this endpoint, but no authn plugin is installed",
+                        },
+                    )
+                raise HTTPError(
+                    403, {"error": "forbidden", "detail": f"requires role(s) {wf.roles}"}
+                )
             try:
                 # wants_request functions get the raw Request instead (see
                 # WhitelistedFunction's own docstring) and parse their own
@@ -1664,7 +1863,9 @@ class RelayProvider:
             # (422) here, rather than letting it become a bare TypeError
             # below that would otherwise escape as an unstructured 500.
             if not isinstance(body, dict):
-                raise HTTPError(422, {"error": "JSON body must be an object", "detail": type(body).__name__})
+                raise HTTPError(
+                    422, {"error": "JSON body must be an object", "detail": type(body).__name__}
+                )
             # Query-string args first (the natural way to call a GET),
             # then the body on top (only ever present for methods that
             # conventionally carry one) — so a GET with no body works from
@@ -1720,7 +1921,9 @@ class RelayProvider:
                 try:
                     payload = _build_payload(wf, kwargs)
                 except arc.codec.CodecError as exc:
-                    raise HTTPError(400, {"error": "invalid arguments", "detail": str(exc)}) from exc
+                    raise HTTPError(
+                        400, {"error": "invalid arguments", "detail": str(exc)}
+                    ) from exc
                 kwargs = {
                     wf.payload_param: payload,
                     **{k: v for k, v in kwargs.items() if k in _INJECTED_PARAM_NAMES},
@@ -1734,7 +1937,9 @@ class RelayProvider:
                     # inside wf.fn.
                     _coerce_kwargs(wf, kwargs)
                 except arc.codec.CodecError as exc:
-                    raise HTTPError(400, {"error": "invalid arguments", "detail": str(exc)}) from exc
+                    raise HTTPError(
+                        400, {"error": "invalid arguments", "detail": str(exc)}
+                    ) from exc
             try:
                 # Bind (never call) against the real signature first — this
                 # is where a body with missing/unexpected/mistyped keys
@@ -1810,7 +2015,11 @@ class RelayProvider:
 
         for method in wf.methods:
             gateway.add_route(
-                method, wf.path, handler, summary=f"whitelisted: {wf.name}", max_body_bytes=wf.max_body_bytes
+                method,
+                wf.path,
+                handler,
+                summary=f"whitelisted: {wf.name}",
+                max_body_bytes=wf.max_body_bytes,
             )
 
     # ------------------------------------------------------------------ #
@@ -1859,7 +2068,9 @@ class RelayProvider:
         self._local_cache[key] = (value, time_module.monotonic() + ex if ex is not None else None)
         if len(self._local_cache) % 256 == 0:
             now = time_module.monotonic()
-            for k in [k for k, (_v, exp) in self._local_cache.items() if exp is not None and now >= exp]:
+            for k in [
+                k for k, (_v, exp) in self._local_cache.items() if exp is not None and now >= exp
+            ]:
                 self._local_cache.pop(k, None)
 
     async def cache_delete(self, key: str) -> None:
@@ -1950,7 +2161,9 @@ class RelayProvider:
             if lineup.is_task(fn):
                 coro = lineup.enqueue(fn, *args, **kwargs)
             else:
-                lineup.check_resolvable(fn)  # raises TypeError here, synchronously, before any Task exists
+                lineup.check_resolvable(
+                    fn
+                )  # raises TypeError here, synchronously, before any Task exists
                 coro = lineup.enqueue_by_path(fn, *args, queue=queue, **kwargs)
 
             # _track_task: most callers drop the returned Task — without a
@@ -1990,7 +2203,8 @@ class RelayProvider:
                             "queue": queue,
                             "executor": "relay",
                             "job_type": "Task",  # the in-process fallback has no scheduling concept at all
-                            "queued_by": (getattr(fn, "__module__", "") or "").split(".")[0] or None,
+                            "queued_by": (getattr(fn, "__module__", "") or "").split(".")[0]
+                            or None,
                             "status": status,
                             "error": error,
                             "started_at": started_at,
@@ -1999,7 +2213,9 @@ class RelayProvider:
                         },
                     )
                 except Exception as log_exc:
-                    self.log(f"failed to write _job_log row for {fn.__name__}: {log_exc}", level="error")
+                    self.log(
+                        f"failed to write _job_log row for {fn.__name__}: {log_exc}", level="error"
+                    )
 
         task = self._track_task(asyncio.create_task(_run_and_log()))
 
@@ -2027,7 +2243,8 @@ class RelayProvider:
 
     def log(self, message: str, *, level: str = "info", **context: Any) -> None:
         _logger.log(
-            _LOG_LEVELS.get(level, logging.INFO), message,
+            _LOG_LEVELS.get(level, logging.INFO),
+            message,
             extra={"relay_level": level, **context},
         )
 
@@ -2038,7 +2255,9 @@ class RelayProvider:
             "hooks_registered": hook_count,
             "whitelisted_functions": len(self._whitelisted),
             "cache_lock_backend": "redix" if self._redix is not None else "in-process fallback",
-            "queue_backend": "lineup (TaskIQ + Redis)" if self._kernel.has("lineup") else "in-process fallback",
+            "queue_backend": "lineup (TaskIQ + Redis)"
+            if self._kernel.has("lineup")
+            else "in-process fallback",
         }
 
 
@@ -2068,7 +2287,10 @@ def register(kernel: Any) -> None:
     kernel.get("psqldb").register_model(Path(__file__).parent / "schemas")
 
     kernel.export(
-        CAPABILITY, provider, requires=["psqldb"], optional_requires=["authn", "redix", "gateway", "lineup"]
+        CAPABILITY,
+        provider,
+        requires=["psqldb"],
+        optional_requires=["authn", "redix", "gateway", "lineup"],
     )
 
     # relay's own maintenance job, registered on itself via the exact

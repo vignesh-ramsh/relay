@@ -18,8 +18,12 @@ which matters more here than anywhere else — this is "the single riskiest
 piece of the whole system" per §3.4.
 
 Scope, stated plainly (not an oversight list — a boundary):
-  * filters: flat dict, implicit AND, one of a fixed operator set below.
-    No OR/NOT grouping — that's the complexity cliff every ORM falls off.
+  * filters: flat dict, implicit AND, one of a fixed operator set below,
+    plus ONE bounded escape hatch for OR — the reserved `any_of` key (a
+    list of at most MAX_ANY_OF_BRANCHES flat AND-dicts, OR'd together; a
+    branch can't itself contain `any_of` — no nesting, no nested NOT, no
+    arbitrary boolean expression tree). That's the actual complexity cliff
+    every ORM falls off, and this stays well short of it.
   * order_by / fields / group_by: plain columns on the table itself only.
     No dotted paths, no joins — joins happen ONLY inside an explicit
     arc.relay.resolve(field, subfields), never implicitly.
@@ -47,12 +51,30 @@ from .resolvers import FieldResolver
 
 MAX_ORDER_FIELDS = 5
 MAX_AGGREGATES = 10
+MAX_ANY_OF_BRANCHES = 10
 
-_COMPARISON_OPS: dict[str, str] = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+#: Reserved top-level filter key — see parse_filters()'s any_of handling
+#: and the module docstring's "Scope" section above.
+ANY_OF_KEY = "any_of"
+
+_COMPARISON_OPS: dict[str, str] = {
+    "eq": "=",
+    "ne": "<>",
+    "gt": ">",
+    "gte": ">=",
+    "lt": "<",
+    "lte": "<=",
+}
 _LIKE_OPS = frozenset({"like", "ilike"})
 _LIKE_WRAP_OPS: dict[str, str] = {"contains": "%{}%", "startswith": "{}%", "endswith": "%{}"}
 _SET_OPS = frozenset({"in", "not_in"})
-_ALL_OPS = frozenset(_COMPARISON_OPS) | _LIKE_OPS | frozenset(_LIKE_WRAP_OPS) | _SET_OPS | {"range", "is_null"}
+_ALL_OPS = (
+    frozenset(_COMPARISON_OPS)
+    | _LIKE_OPS
+    | frozenset(_LIKE_WRAP_OPS)
+    | _SET_OPS
+    | {"range", "is_null"}
+)
 _AGG_FNS = frozenset({"count", "sum", "avg", "min", "max"})
 
 # psqldb.migrate.ddl.RefColumn's shape, duck-typed here (table/column/sql_type
@@ -79,6 +101,7 @@ class Resolve:
     under `field` in the result: row["department"] = {"dept_name": ..., ...}.
     One hop only — `field` must itself be a plain column name on the base
     table, never another Resolve or a dotted path."""
+
     field: str
     subfields: tuple[str, ...]
 
@@ -103,17 +126,34 @@ def _field_sql_type(table: str, field: Field, ref_columns: RefColumns) -> str:
     return field.sql_type()
 
 
-def parse_filters(schema: TableSchema, filters: dict[str, Any] | None) -> list[tuple[Field, str, Any]]:
-    """Validates a raw filter dict into (field, operator, value) triples.
-    `{"status": "Active"}` is sugar for `{"status": {"eq": "Active"}}`."""
+ParsedFilters = list[tuple[Field, str, Any]]
+
+
+def parse_filters(
+    schema: TableSchema, filters: dict[str, Any] | None
+) -> tuple[ParsedFilters, list[ParsedFilters]]:
+    """Validates a raw filter dict into ((field, operator, value) triples,
+    any_of OR-branches). `{"status": "Active"}` is sugar for
+    `{"status": {"eq": "Active"}}`. The second element is empty unless the
+    reserved `any_of` key is present — see the module docstring's "Scope"
+    section. Each any_of branch is validated by recursing into this same
+    function (rejecting a nested `any_of`), so a branch gets exactly the
+    same column/operator/value checks a top-level filter dict does — no
+    separate, easier-to-drift validation path for the OR case."""
     if not filters:
-        return []
+        return [], []
+
+    filters = dict(filters)  # never mutate the caller's own dict
+    any_of_raw = filters.pop(ANY_OF_KEY, None)
+
     columns = {f.name: f for f in schema.column_fields()}
     unknown = [k for k in filters if k not in columns]
     if unknown:
-        raise QueryError(f"unknown column(s) {unknown} on table '{schema.table}' (known: {sorted(columns)}).")
+        raise QueryError(
+            f"unknown column(s) {unknown} on table '{schema.table}' (known: {sorted(columns)})."
+        )
 
-    parsed: list[tuple[Field, str, Any]] = []
+    parsed: ParsedFilters = []
     for name, raw in filters.items():
         field = columns[name]
         if isinstance(raw, dict):
@@ -123,27 +163,67 @@ def parse_filters(schema: TableSchema, filters: dict[str, Any] | None) -> list[t
                     f"the engine doesn't support combining operators on one field (or OR/NOT "
                     f"grouping across fields) in this bounded first cut."
                 )
-            (op, value), = raw.items()
+            ((op, value),) = raw.items()
         else:
             op, value = "eq", raw
         if op not in _ALL_OPS:
-            raise QueryError(f"filter '{name}': unknown operator '{op}' — expected one of {sorted(_ALL_OPS)}.")
+            raise QueryError(
+                f"filter '{name}': unknown operator '{op}' — expected one of {sorted(_ALL_OPS)}."
+            )
         if op == "range" and (not isinstance(value, (list, tuple)) or len(value) != 2):
-            raise QueryError(f"filter '{name}': 'range' requires a 2-element [min, max] list, got {value!r}.")
+            raise QueryError(
+                f"filter '{name}': 'range' requires a 2-element [min, max] list, got {value!r}."
+            )
         if op in _SET_OPS and not isinstance(value, (list, tuple)):
             raise QueryError(f"filter '{name}': '{op}' requires a list of values, got {value!r}.")
         parsed.append((field, op, value))
-    return parsed
+
+    any_of_branches: list[ParsedFilters] = []
+    if any_of_raw is not None:
+        if not isinstance(any_of_raw, (list, tuple)) or not any_of_raw:
+            raise QueryError(
+                f"'{ANY_OF_KEY}' must be a non-empty list of filter dicts, got {any_of_raw!r}."
+            )
+        if len(any_of_raw) > MAX_ANY_OF_BRANCHES:
+            raise QueryError(
+                f"'{ANY_OF_KEY}' supports at most {MAX_ANY_OF_BRANCHES} branches, "
+                f"got {len(any_of_raw)}."
+            )
+        for branch in any_of_raw:
+            if not isinstance(branch, dict) or not branch:
+                raise QueryError(
+                    f"each '{ANY_OF_KEY}' branch must be a non-empty filter dict, got {branch!r}."
+                )
+            if ANY_OF_KEY in branch:
+                raise QueryError(
+                    f"'{ANY_OF_KEY}' cannot be nested inside another '{ANY_OF_KEY}' branch."
+                )
+            branch_parsed, _ = parse_filters(schema, branch)
+            any_of_branches.append(branch_parsed)
+
+    return parsed, any_of_branches
 
 
 def render_where(
-    table: str, parsed: list[tuple[Field, str, Any]], ref_columns: RefColumns, *, start: int = 1
+    table: str,
+    parsed: ParsedFilters,
+    any_of_branches: list[ParsedFilters] | None,
+    ref_columns: RefColumns,
+    *,
+    start: int = 1,
 ) -> tuple[str, list[Any]]:
     """Turns parsed (field, op, value) triples into one parameterized WHERE
-    fragment — implicit AND across all of them. Returns ("", []) for no
-    filters, never "WHERE" with nothing after it."""
-    if not parsed:
-        return "", []
+    fragment — implicit AND across all of them, AND'd together with one
+    more clause if any_of_branches is given: each branch rendered as its
+    own (already-AND'd) parenthesized group, OR'd together, exactly the
+    way `parsed`'s own AND-clauses combine with everything else. Returns
+    ("", []) when there's nothing at all — never "WHERE" with nothing
+    after it.
+
+    `any_of_branches` is passed as None (not just []) when recursing to
+    render one branch's own clause below — a branch can never itself
+    contain another any_of (parse_filters already rejects that), so there
+    is no infinite recursion here, just one guaranteed-flat level."""
     clauses: list[str] = []
     params: list[Any] = []
     i = start
@@ -176,26 +256,42 @@ def render_where(
             clauses.append(f"{col} IS NULL" if value else f"{col} IS NOT NULL")
         else:  # pragma: no cover - _ALL_OPS is exhaustive against the branches above
             raise AssertionError(f"unhandled operator {op!r}")
+
+    if any_of_branches:
+        branch_sqls: list[str] = []
+        for branch in any_of_branches:
+            branch_sql, branch_params = render_where(table, branch, None, ref_columns, start=i)
+            branch_sqls.append(f"({branch_sql})")
+            params.extend(branch_params)
+            i += len(branch_params)
+        clauses.append("(" + " OR ".join(branch_sqls) + ")")
+
     return " AND ".join(clauses), params
 
 
 def render_order_by(table: str, schema: TableSchema, order_by: list[str]) -> str:
     if len(order_by) > MAX_ORDER_FIELDS:
-        raise QueryError(f"order_by supports at most {MAX_ORDER_FIELDS} fields, got {len(order_by)}.")
+        raise QueryError(
+            f"order_by supports at most {MAX_ORDER_FIELDS} fields, got {len(order_by)}."
+        )
     columns = {f.name: f for f in schema.column_fields()}
     parts = []
     for raw in order_by:
         desc = raw.startswith("-")
         name = raw[1:] if desc else raw
         if name not in columns:
-            raise QueryError(f"unknown column '{name}' in order_by on table '{table}' (known: {sorted(columns)}).")
+            raise QueryError(
+                f"unknown column '{name}' in order_by on table '{table}' (known: {sorted(columns)})."
+            )
         parts.append(f'"{name}" {"DESC" if desc else "ASC"}')
     return ", ".join(parts)
 
 
 def _validate_limit_offset(limit: int | None, offset: int) -> None:
     if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit < 0):
-        raise QueryError(f"limit must be a non-negative integer or None (fetch all), got {limit!r}.")
+        raise QueryError(
+            f"limit must be a non-negative integer or None (fetch all), got {limit!r}."
+        )
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise QueryError(f"offset must be a non-negative integer, got {offset!r}.")
 
@@ -234,9 +330,13 @@ def build_select(
                         f"REFERENCE field on table '{table}'."
                     )
                 ref = ref_columns.get((table, item.field))
-                if ref is None:  # defensive — every REFERENCE field always has one, see resolve_ref_columns
+                if (
+                    ref is None
+                ):  # defensive — every REFERENCE field always has one, see resolve_ref_columns
                     raise QueryError(f"'{item.field}' on table '{table}' has no resolvable target.")
-                target_schema = schema_lookup(ref.table)  # raises psqldb.SchemaError if somehow missing
+                target_schema = schema_lookup(
+                    ref.table
+                )  # raises psqldb.SchemaError if somehow missing
                 target_columns = {f.name: f for f in target_schema.column_fields()}
                 unknown = [sf for sf in item.subfields if sf not in target_columns]
                 if unknown:
@@ -264,11 +364,13 @@ def build_select(
                 select_parts.append(f'"{table}"."{item.field}" AS "{item.field}"')
             else:
                 if item not in own_columns:
-                    raise QueryError(f"unknown column '{item}' on table '{table}' (known: {sorted(own_columns)}).")
+                    raise QueryError(
+                        f"unknown column '{item}' on table '{table}' (known: {sorted(own_columns)})."
+                    )
                 select_parts.append(f'"{table}"."{item}" AS "{item}"')
 
-    parsed_filters = parse_filters(schema, filters)
-    where_sql, params = render_where(table, parsed_filters, ref_columns, start=1)
+    parsed_filters, any_of_branches = parse_filters(schema, filters)
+    where_sql, params = render_where(table, parsed_filters, any_of_branches, ref_columns, start=1)
 
     sql = f'SELECT {"DISTINCT " if distinct else ""}{", ".join(select_parts)} FROM "{table}"'
     sql += "".join(f" {j}" for j in join_parts)
@@ -286,8 +388,8 @@ def build_select(
 def build_count(
     table: str, schema: TableSchema, *, filters: dict[str, Any] | None, ref_columns: RefColumns
 ) -> tuple[str, list[Any]]:
-    parsed = parse_filters(schema, filters)
-    where_sql, params = render_where(table, parsed, ref_columns, start=1)
+    parsed, any_of_branches = parse_filters(schema, filters)
+    where_sql, params = render_where(table, parsed, any_of_branches, ref_columns, start=1)
     sql = f'SELECT count(*) FROM "{table}"'
     if where_sql:
         sql += f" WHERE {where_sql}"
@@ -306,12 +408,16 @@ def build_aggregate(
     if not aggregates:
         raise QueryError("aggregate() requires at least one entry in `aggregates`.")
     if len(aggregates) > MAX_AGGREGATES:
-        raise QueryError(f"aggregate() supports at most {MAX_AGGREGATES} aggregates, got {len(aggregates)}.")
+        raise QueryError(
+            f"aggregate() supports at most {MAX_AGGREGATES} aggregates, got {len(aggregates)}."
+        )
     columns = {f.name: f for f in schema.column_fields()}
     group_by = group_by or []
     unknown_group = [g for g in group_by if g not in columns]
     if unknown_group:
-        raise QueryError(f"unknown column(s) {unknown_group} in group_by on table '{table}' (known: {sorted(columns)}).")
+        raise QueryError(
+            f"unknown column(s) {unknown_group} in group_by on table '{table}' (known: {sorted(columns)})."
+        )
 
     select_parts = [f'"{g}"' for g in group_by]
     for alias, spec in aggregates.items():
@@ -326,21 +432,27 @@ def build_aggregate(
                 f"(letters, digits, underscores; not starting with a digit)."
             )
         if not isinstance(spec, (list, tuple)) or len(spec) != 2:
-            raise QueryError(f"aggregate '{alias}': expected a (function, field) pair, got {spec!r}.")
+            raise QueryError(
+                f"aggregate '{alias}': expected a (function, field) pair, got {spec!r}."
+            )
         fn, field_name = spec
         if fn not in _AGG_FNS:
-            raise QueryError(f"aggregate '{alias}': unknown function '{fn}' — expected one of {sorted(_AGG_FNS)}.")
+            raise QueryError(
+                f"aggregate '{alias}': unknown function '{fn}' — expected one of {sorted(_AGG_FNS)}."
+            )
         if field_name == "*":
             if fn != "count":
                 raise QueryError(f"aggregate '{alias}': '*' is only valid with 'count'.")
             select_parts.append(f'{fn}(*) AS "{alias}"')
             continue
         if field_name not in columns:
-            raise QueryError(f"aggregate '{alias}': unknown column '{field_name}' on table '{table}'.")
+            raise QueryError(
+                f"aggregate '{alias}': unknown column '{field_name}' on table '{table}'."
+            )
         select_parts.append(f'{fn}("{field_name}") AS "{alias}"')
 
-    parsed = parse_filters(schema, filters)
-    where_sql, params = render_where(table, parsed, ref_columns, start=1)
+    parsed, any_of_branches = parse_filters(schema, filters)
+    where_sql, params = render_where(table, parsed, any_of_branches, ref_columns, start=1)
     sql = f'SELECT {", ".join(select_parts)} FROM "{table}"'
     if where_sql:
         sql += f" WHERE {where_sql}"
