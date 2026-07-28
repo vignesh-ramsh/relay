@@ -146,7 +146,7 @@ def parse_filters(
     filters = dict(filters)  # never mutate the caller's own dict
     any_of_raw = filters.pop(ANY_OF_KEY, None)
 
-    columns = {f.name: f for f in schema.column_fields()}
+    columns = schema.columns_by_name
     unknown = [k for k in filters if k not in columns]
     if unknown:
         raise QueryError(
@@ -274,7 +274,7 @@ def render_order_by(table: str, schema: TableSchema, order_by: list[str]) -> str
         raise QueryError(
             f"order_by supports at most {MAX_ORDER_FIELDS} fields, got {len(order_by)}."
         )
-    columns = {f.name: f for f in schema.column_fields()}
+    columns = schema.columns_by_name
     parts = []
     for raw in order_by:
         desc = raw.startswith("-")
@@ -313,61 +313,75 @@ def build_select(
     through (get() is just this with filters={"id": ...} or a caller-given
     filter dict, limit=1)."""
     _validate_limit_offset(limit, offset)
-    own_columns = {f.name: f for f in schema.column_fields()}
+    own_columns = schema.columns_by_name
+
+    # No wildcard, anywhere: a caller must always name exactly the columns
+    # it wants — `fields=None` (the old "SELECT *" default) and `fields=[]`
+    # are both rejected the same way an unknown column name already is.
+    # Two motivations, not one: security (the confirmed finding this
+    # closes — `arc.relay.list("_users")` used to hand back
+    # `password_hash` to any caller who simply forgot to think about
+    # fields) and payload size (a caller reading three columns off a
+    # fifty-column table no longer pays to serialize/transmit the other
+    # forty-seven). `id` is NOT auto-added — "explicit" means explicit;
+    # a caller that needs it back names it, same as any other column.
+    if not fields:
+        raise QueryError(
+            f"table '{table}': 'fields' must be a non-empty list naming exactly the "
+            f"columns you want — 'SELECT *' (fields=None or fields=[]) is not allowed. "
+            f"Known columns: {sorted(own_columns)}."
+        )
 
     select_parts: list[str] = []
     join_parts: list[str] = []
-    if fields is None:
-        select_parts.append(f'"{table}".*')
-    else:
-        seen_aliases: set[str] = set()
-        for item in fields:
-            if isinstance(item, Resolve):
-                ref_field = own_columns.get(item.field)
-                if ref_field is None or ref_field.type != "REFERENCE":
-                    raise QueryError(
-                        f"arc.relay.resolve('{item.field}', ...): '{item.field}' is not a "
-                        f"REFERENCE field on table '{table}'."
-                    )
-                ref = ref_columns.get((table, item.field))
-                if (
-                    ref is None
-                ):  # defensive — every REFERENCE field always has one, see resolve_ref_columns
-                    raise QueryError(f"'{item.field}' on table '{table}' has no resolvable target.")
-                target_schema = schema_lookup(
-                    ref.table
-                )  # raises psqldb.SchemaError if somehow missing
-                target_columns = {f.name: f for f in target_schema.column_fields()}
-                unknown = [sf for sf in item.subfields if sf not in target_columns]
-                if unknown:
-                    raise QueryError(
-                        f"arc.relay.resolve('{item.field}', ...): unknown column(s) {unknown} "
-                        f"on table '{ref.table}' (known: {sorted(target_columns)})."
-                    )
-                alias = item.field
-                if alias not in seen_aliases:
-                    join_parts.append(
-                        f'LEFT JOIN "{ref.table}" AS "{alias}" ON "{alias}"."{ref.column}" = "{table}"."{item.field}"'
-                    )
-                    seen_aliases.add(alias)
-                for sf in item.subfields:
-                    select_parts.append(f'"{alias}"."{sf}" AS "{alias}.{sf}"')
-            elif isinstance(item, FieldResolver):
-                # Selected exactly like a plain column — the resolver only
-                # changes what happens to the value AFTER the fetch (see
-                # relay.resolvers / RelayProvider._resolve_fields), not how
-                # it's read out of SQL.
-                if item.field not in own_columns:
-                    raise QueryError(
-                        f"unknown column '{item.field}' on table '{table}' (known: {sorted(own_columns)})."
-                    )
-                select_parts.append(f'"{table}"."{item.field}" AS "{item.field}"')
-            else:
-                if item not in own_columns:
-                    raise QueryError(
-                        f"unknown column '{item}' on table '{table}' (known: {sorted(own_columns)})."
-                    )
-                select_parts.append(f'"{table}"."{item}" AS "{item}"')
+    seen_aliases: set[str] = set()
+    for item in fields:
+        if isinstance(item, Resolve):
+            ref_field = own_columns.get(item.field)
+            if ref_field is None or ref_field.type != "REFERENCE":
+                raise QueryError(
+                    f"arc.relay.resolve('{item.field}', ...): '{item.field}' is not a "
+                    f"REFERENCE field on table '{table}'."
+                )
+            ref = ref_columns.get((table, item.field))
+            if (
+                ref is None
+            ):  # defensive — every REFERENCE field always has one, see resolve_ref_columns
+                raise QueryError(f"'{item.field}' on table '{table}' has no resolvable target.")
+            target_schema = schema_lookup(
+                ref.table
+            )  # raises psqldb.SchemaError if somehow missing
+            target_columns = target_schema.columns_by_name
+            unknown = [sf for sf in item.subfields if sf not in target_columns]
+            if unknown:
+                raise QueryError(
+                    f"arc.relay.resolve('{item.field}', ...): unknown column(s) {unknown} "
+                    f"on table '{ref.table}' (known: {sorted(target_columns)})."
+                )
+            alias = item.field
+            if alias not in seen_aliases:
+                join_parts.append(
+                    f'LEFT JOIN "{ref.table}" AS "{alias}" ON "{alias}"."{ref.column}" = "{table}"."{item.field}"'
+                )
+                seen_aliases.add(alias)
+            for sf in item.subfields:
+                select_parts.append(f'"{alias}"."{sf}" AS "{alias}.{sf}"')
+        elif isinstance(item, FieldResolver):
+            # Selected exactly like a plain column — the resolver only
+            # changes what happens to the value AFTER the fetch (see
+            # relay.resolvers / RelayProvider._resolve_fields), not how
+            # it's read out of SQL.
+            if item.field not in own_columns:
+                raise QueryError(
+                    f"unknown column '{item.field}' on table '{table}' (known: {sorted(own_columns)})."
+                )
+            select_parts.append(f'"{table}"."{item.field}" AS "{item.field}"')
+        else:
+            if item not in own_columns:
+                raise QueryError(
+                    f"unknown column '{item}' on table '{table}' (known: {sorted(own_columns)})."
+                )
+            select_parts.append(f'"{table}"."{item}" AS "{item}"')
 
     parsed_filters, any_of_branches = parse_filters(schema, filters)
     where_sql, params = render_where(table, parsed_filters, any_of_branches, ref_columns, start=1)
@@ -411,7 +425,7 @@ def build_aggregate(
         raise QueryError(
             f"aggregate() supports at most {MAX_AGGREGATES} aggregates, got {len(aggregates)}."
         )
-    columns = {f.name: f for f in schema.column_fields()}
+    columns = schema.columns_by_name
     group_by = group_by or []
     unknown_group = [g for g in group_by if g not in columns]
     if unknown_group:

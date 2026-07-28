@@ -11,10 +11,13 @@
     {"id": "AA07", "name": "error", "type": "TEXT"},
     {"id": "AA08", "name": "started_at", "type": "DATETIME", "required": true},
     {"id": "AA09", "name": "finished_at", "type": "DATETIME", "required": true},
-    {"id": "AA10", "name": "duration_ms", "type": "INT", "required": true}
+    {"id": "AA10", "name": "duration_ms", "type": "INT", "required": true},
+    {"id": "AA11", "name": "request_id", "type": "STRING", "length": 128},
+    {"id": "AA12", "name": "triggered_by", "type": "STRING", "length": 255}
   ],
   "index": [
     {"key": "idx_job_log_finished_at", "fields": ["finished_at"]},
-    {"key": "idx_job_log_task_name", "fields": ["task_name"]}
+    {"key": "idx_job_log_task_name", "fields": ["task_name"]},
+    {"key": "idx_job_log_request_id", "fields": ["request_id"]}
   ]
 }

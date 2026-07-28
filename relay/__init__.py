@@ -61,11 +61,57 @@ from .resolvers import FieldResolver
 
 CAPABILITY = "relay"
 
-# list()'s default cap (§9/§3 — the doc's own "the day a 2M-row table meets
-# a UI that forgot `limit`" scenario). Callers that genuinely need
-# everything pass limit=None explicitly — the escape hatch stays, it's
-# just no longer the silent default.
-DEFAULT_LIST_LIMIT = 1000
+# list()/list_page()'s row cap (§9/§3 — the doc's own "the day a 2M-row
+# table meets a UI that forgot `limit`" scenario), configurable per project
+# via arc.settings (declared in register() below, plain — not secret,
+# there's nothing sensitive about a row-count ceiling).
+#
+#   * RELAY_LIST_DEFAULT_LIMIT_KEY — used when a caller doesn't pass
+#     `limit` at all. Callers that genuinely need everything pass
+#     limit=None explicitly — that escape hatch is untouched by either
+#     setting, and always means "no cap," never something a client can
+#     reach through a query-string value (a whitelisted function author
+#     has to choose it in code).
+#   * RELAY_LIST_MAX_LIMIT_KEY — a hard ceiling on any EXPLICIT `limit`,
+#     scoped to list()/list_page() only (see _resolve_and_cap_list_limit).
+#     Deliberately NOT enforced on `get()`'s own internal limit=1, or on
+#     save()/save_many()'s match_on resolution lookups — those are
+#     already-bounded internal correctness mechanisms, not the "someone
+#     forgot a limit on a browse endpoint" case this setting exists for.
+#
+# The constants below are only the DECLARED DEFAULTS for those two
+# settings (used the first time a project boots, before anyone has run
+# `arc settings set` for either key) — the numbers actually in effect
+# always come from self._list_default_limit/_list_max_limit, resolved once
+# in register() from arc.settings, same pattern as psqldb's own
+# POOL_MIN_SIZE_KEY/POOL_MAX_SIZE_KEY.
+RELAY_LIST_DEFAULT_LIMIT_KEY = "relay_list_default_limit"
+RELAY_LIST_MAX_LIMIT_KEY = "relay_list_max_limit"
+DEFAULT_LIST_LIMIT = 20
+MAX_LIST_LIMIT = 1000
+
+# The Python-level sentinel for "the caller passed no `limit` argument at
+# all" — distinct from an EXPLICIT `limit=None` (which already has its own
+# meaning: no cap, ever, unconditionally). A plain `= DEFAULT_LIST_LIMIT`
+# default can't be used instead: the actual number to fall back to is a
+# per-project SETTING, resolved once at boot onto the instance
+# (self._list_default_limit), not a fixed value known at class-definition
+# time.
+_UNSET_LIMIT = object()
+
+# Cap on the in-process cache_get/cache_set fallback (no redix installed) —
+# see cache_set's own comment for why the existing expiry sweep alone isn't
+# enough. A plain constant, not a setting: this is a "does this deployment
+# have redix or not" concern, not something a project would ever want to
+# tune per environment.
+_LOCAL_CACHE_MAX_ENTRIES = 10_000
+
+# Cap on how deep a write can nest inside another write's own hooks (a
+# hook calling arc.relay.save()/delete(), whose own hook calls another,
+# ...) before this is almost certainly a bug (an infinite loop, or a hook
+# that recurses without a base case) rather than a legitimate call chain
+# — see _write_transaction's own use of this.
+_MAX_WRITE_DEPTH = 10
 
 # The concrete verb set a whitelisted function registers when `methods` is
 # left unspecified (docs: methods is a RESTRICTION when given, not a
@@ -99,10 +145,15 @@ PRECOMMIT_EVENTS = frozenset(
 POSTCOMMIT_EVENTS = frozenset({"after_commit", "on_rollback"})
 
 # Injected by _wire_gateway_route itself (identity/client_ip/cookies/request/
-# dry_run) — never sourced from the caller's own query/body/path, so these
-# names are never candidates for the coercion/payload inspection below,
-# whatever a function happens to annotate them as.
-_INJECTED_PARAM_NAMES = frozenset({"identity", "client_ip", "cookies", "request", "dry_run"})
+# dry_run/request_id) — never sourced from the caller's own query/body/path,
+# so these names are never candidates for the coercion/payload inspection
+# below, whatever a function happens to annotate them as. request_id in
+# particular MUST be here rather than left to ordinary kwarg handling: an
+# inbound `?request_id=...` would otherwise let a caller forge its own
+# correlation id straight into the logs.
+_INJECTED_PARAM_NAMES = frozenset(
+    {"identity", "client_ip", "cookies", "request", "dry_run", "request_id"}
+)
 
 # Every scalar type arc.codec (msgspec) can coerce a raw string into —
 # exactly what a query-string value always arrives as, since a URL has no
@@ -440,6 +491,15 @@ class WhitelistedFunction:
     wants_client_ip: bool = False
     wants_cookies: bool = False
     wants_request: bool = False
+    wants_request_id: bool = False  # same mechanism again, for a function that
+    # declares a `request_id` parameter — Gateway's own
+    # per-request correlation id (gateway.middleware.
+    # request_id_middleware). Always the server-assigned
+    # value, never a caller-supplied `?request_id=`;
+    # it's in _INJECTED_PARAM_NAMES precisely so a
+    # client can't forge one into the logs. Also
+    # available without declaring the parameter at all,
+    # via arc.relay.context().request_id.
     wants_dry_run: bool = False  # same mechanism, mirrored, for a function that
     # declares a `dry_run` parameter — True whenever
     # the inbound request used a safe/idempotent verb
@@ -483,6 +543,15 @@ class WhitelistedFunction:
 # else again, ...) with no extra plumbing per level.
 _active_conn: ContextVar[Any | None] = ContextVar("arc_relay_active_conn", default=None)
 
+# How many writes deep the current call chain is nested (a hook calling
+# arc.relay.save()/delete(), whose own hook calls another, ...) — same
+# task-scoped-and-inherited contextvar shape as _active_conn, incremented
+# once per _write_transaction() entry regardless of new_transaction (the
+# guard this backs is about runaway recursion/stack depth, not about
+# transaction independence, so an intentionally-independent nested write
+# still counts). See _write_transaction's own use of _MAX_WRITE_DEPTH.
+_write_depth: ContextVar[int] = ContextVar("arc_relay_write_depth", default=0)
+
 # Set for the duration of a GET-triggered whitelisted call (_wire_gateway_route,
 # below) — read by every write primitive to decide whether its own
 # conn.transaction() should actually commit. Same task-scoped-and-inherited
@@ -507,6 +576,70 @@ _dry_run: ContextVar[bool] = ContextVar("arc_relay_dry_run", default=False)
 # never an error.
 _active_stream: ContextVar["asyncio.Queue | None"] = ContextVar(
     "arc_relay_active_stream", default=None
+)
+
+# Post-commit hooks (after_commit/on_rollback) waiting on the OUTERMOST
+# write transaction to actually resolve — see _postcommit_scope below for
+# the full reasoning. Holds a list of (table, ctx, this_write_succeeded)
+# entries; only the outermost write ever creates one, flushes it, or
+# resets it. None (the default) means no write is in progress at all.
+_postcommit_queue: ContextVar[list | None] = ContextVar(
+    "arc_relay_postcommit_queue", default=None
+)
+
+
+@dataclass(frozen=True)
+class CallContext:
+    """Ambient "who is asking, and as part of what request" — populated at
+    the Gateway boundary (_wire_gateway_route) and readable anywhere
+    downstream via `arc.relay.context()`.
+
+    Every field is a plain, immutable, JSON-encodable value on purpose.
+    The live `identity` object is deliberately NOT carried here: it can
+    hold references to a session, a cache entry, or a connection, none of
+    which are safe to hand to a background task that outlives the request
+    (that is exactly the class of bug enqueue() used to have with the
+    ambient DB connection). A whitelisted function that genuinely needs
+    the full identity object still declares an `identity` parameter and
+    gets it injected directly, unchanged.
+
+    `request_id` is Gateway's own per-request correlation id (see
+    gateway.middleware.request_id_middleware) — the same value returned to
+    the caller in the `X-Request-ID` response header and written into
+    every `_job_log` row a job enqueued by this request produces, which is
+    what makes "this slow job came from that request" answerable at all.
+    """
+
+    request_id: str | None = None
+    user: str | None = None  # the acting user's EMAIL — same value psqldb's
+    # created_by/updated_by audit columns store (never a UUID)
+    roles: tuple[str, ...] = ()
+
+    def is_empty(self) -> bool:
+        return self.request_id is None and self.user is None and not self.roles
+
+
+_EMPTY_CALL_CONTEXT = CallContext()
+
+# The on-the-wire label names a CallContext travels under when a job has to
+# cross a PROCESS boundary (see context_labels()/use_context_labels()). The
+# `arc_ctx_` prefix keeps them unambiguously ours: a TaskIQ message also
+# carries TaskIQ's own labels (`schedule`, `schedule_id`), and a future
+# layer may add more — the decoder reads only these three keys and ignores
+# everything else rather than assuming it owns the whole label dict.
+_CTX_LABEL_REQUEST_ID = "arc_ctx_request_id"
+_CTX_LABEL_USER = "arc_ctx_user"
+_CTX_LABEL_ROLES = "arc_ctx_roles"
+
+# WHO and WHICH REQUEST the current call belongs to — deliberately plain,
+# immutable, serializable data (never the live authn identity object or
+# anything holding a DB connection), because this is the one piece of
+# ambient state that SHOULD survive into a background job: see enqueue(),
+# which clears every other contextvar it inherits and keeps only this one.
+# Empty (the default) whenever nothing set it: a CLI run, a test, a
+# scheduled task with no originating request. Never an error to read.
+_call_context: ContextVar[CallContext] = ContextVar(
+    "arc_relay_call_context", default=_EMPTY_CALL_CONTEXT
 )
 
 
@@ -556,14 +689,23 @@ class RelayProvider:
     HookContext = HookContext
     WhitelistedFunction = WhitelistedFunction
     Doc = Doc
+    CallContext = CallContext
     QueryError = (
         query.QueryError
     )  # get/list/count/aggregate/save's "bad filter/field/operator" error — see relay.query
 
-    def __init__(self, kernel: Any) -> None:
+    def __init__(
+        self,
+        kernel: Any,
+        *,
+        list_default_limit: int = DEFAULT_LIST_LIMIT,
+        list_max_limit: int = MAX_LIST_LIMIT,
+    ) -> None:
         self._kernel = kernel
         self._psqldb = kernel.get("psqldb")
         self._redix = kernel.get("redix") if kernel.has("redix") else None
+        self._list_default_limit = list_default_limit
+        self._list_max_limit = list_max_limit
         self._hooks: dict[tuple[str, str], list[HookFn]] = {}
         self._whitelisted: dict[str, WhitelistedFunction] = {}
         # only set while register_hooks()/register_api() is importing one
@@ -694,10 +836,137 @@ class RelayProvider:
                     level="error",
                 )
 
+    def context(self) -> CallContext:
+        """Who is asking, and as part of which request — readable from
+        anywhere downstream of a Gateway call (a hook, a nested save, a
+        background job enqueued by that request) with no plumbing.
+
+        Always returns a real CallContext, never None: outside any request
+        (a CLI run, a test, a `lineup` scheduled task) every field is
+        simply empty, so a caller never needs a None check. See
+        CallContext's own docstring for why it carries plain data rather
+        than the live identity object."""
+        return _call_context.get()
+
+    def context_labels(self) -> dict[str, str]:
+        """Encode the CURRENT CallContext as flat string labels, for a
+        durable queue that has to carry it to another PROCESS (see
+        lineup's enqueue paths, which stamp these onto the TaskIQ message).
+
+        Relay owns both halves of this wire format — this and
+        use_context_labels() below — precisely so `lineup` never has to
+        know what a CallContext is. It moves an opaque dict of strings and
+        hands it back; if relay's own context ever grows a field, only
+        these two methods change, and lineup needs no edit at all. That
+        also keeps the dependency direction correct: relay optionally
+        depends on lineup, never the reverse.
+
+        Strings only, and only for fields that are actually set: TaskIQ's
+        own `AsyncKicker.with_labels(**labels: str | float)` types labels
+        as scalars, so nothing structured may go on the wire directly.
+        `roles` is JSON-encoded (via arc.codec, §3.10's one shared codec)
+        rather than comma-joined — a role name containing the separator
+        would silently split into two otherwise.
+
+        Returns `{}` for an empty context, which is the common case
+        outside a request — a caller can then skip labelling entirely."""
+        ctx = self.context()
+        labels: dict[str, str] = {}
+        if ctx.request_id is not None:
+            labels[_CTX_LABEL_REQUEST_ID] = ctx.request_id
+        if ctx.user is not None:
+            labels[_CTX_LABEL_USER] = ctx.user
+        if ctx.roles:
+            labels[_CTX_LABEL_ROLES] = arc.codec.encode(list(ctx.roles)).decode()
+        return labels
+
+    @contextlib.contextmanager
+    def use_context_labels(self, labels: Any):
+        """Decode labels produced by context_labels() and bind them as the
+        ambient CallContext for the duration of this block — the receiving
+        half of the wire format, called by a `lineup` worker around the
+        job it is about to run.
+
+        `labels` is whatever the queue handed back, which contains TaskIQ's
+        OWN labels too (`schedule`, `schedule_id`, ...) — only the
+        `arc_ctx_*` keys are read, everything else is ignored rather than
+        rejected, so this stays forward-compatible with any label another
+        layer adds later. A message with no arc_ctx_* keys at all (a job
+        enqueued before this existed, or from a CLI with no request) binds
+        a normal empty context, never an error.
+
+        Deliberately tolerant of a malformed `roles` value: a job should
+        not fail because its provenance metadata was garbled in transit —
+        the roles are dropped, the request_id/user are kept, and the work
+        still runs."""
+        labels = labels or {}
+        roles: tuple[str, ...] = ()
+        raw_roles = labels.get(_CTX_LABEL_ROLES)
+        if raw_roles:
+            try:
+                decoded = arc.codec.decode(
+                    raw_roles.encode() if isinstance(raw_roles, str) else raw_roles
+                )
+                if isinstance(decoded, list):
+                    roles = tuple(str(r) for r in decoded)
+            except Exception:  # noqa: BLE001 - provenance metadata must never break the job
+                _logger.warning("could not decode %s from job labels", _CTX_LABEL_ROLES)
+        ctx = CallContext(
+            request_id=labels.get(_CTX_LABEL_REQUEST_ID),
+            user=labels.get(_CTX_LABEL_USER),
+            roles=roles,
+        )
+        token = _call_context.set(ctx)
+        try:
+            yield ctx
+        finally:
+            _call_context.reset(token)
+
     def _track_task(self, task: asyncio.Task) -> asyncio.Task:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    @staticmethod
+    def _detach_request_scoped_state() -> None:
+        """Call FIRST inside any coroutine handed to asyncio.create_task()
+        from here — it severs the request-scoped ambient state the new task
+        would otherwise silently inherit, while deliberately KEEPING the
+        call context.
+
+        asyncio.create_task() copies the current contextvar context into
+        the new task. That is exactly what relay wants for hooks (a nested
+        save correctly sees the enclosing write's connection), and exactly
+        what it must NOT have for a background job, which outlives the
+        request that spawned it:
+
+          * `_active_conn` — the enclosing write's pooled connection. By
+            the time the job runs, that connection has been RELEASED back
+            to the pool and very likely handed to a different request. The
+            job would either fail with a confusing "cannot use
+            Connection.transaction() in a manually started transaction"
+            (its work silently lost — only a log line, nothing raised to
+            anyone) or, worse, issue queries on a connection another
+            request is actively using.
+          * `_dry_run` — a job enqueued during a GET inherited dry_run=True
+            and silently rolled back every write it made, forever, with no
+            error anywhere.
+          * `_postcommit_queue` — the enclosing write's deferred hook list.
+            A background job's own writes are their own outermost
+            transaction and must flush their own hooks, not append to a
+            queue nobody will ever flush.
+          * `_active_stream` — publish() from a detached job would push
+            into a response stream that has already been sent and closed.
+
+        `_call_context` (request_id / user / roles) is deliberately NOT
+        cleared: it is plain immutable data holding no connection and no
+        lifetime, and carrying it is the whole point — it is what makes a
+        job traceable back to the request and user that queued it.
+        """
+        _active_conn.set(None)
+        _dry_run.set(False)
+        _postcommit_queue.set(None)
+        _active_stream.set(None)
 
     # ------------------------------------------------------------------ #
     # Session-bound connections (module docstring; docs/arc.MD §8's arc.di
@@ -722,12 +991,100 @@ class RelayProvider:
 
     @contextlib.asynccontextmanager
     async def _write_transaction(self, *, new_transaction: bool = False):
-        async with self._connection(new_transaction=new_transaction) as conn:
-            token = _active_conn.set(conn)
-            try:
-                yield conn
-            finally:
-                _active_conn.reset(token)
+        depth = _write_depth.get()
+        if depth >= _MAX_WRITE_DEPTH:
+            raise RelayError(
+                f"write recursion depth exceeded ({_MAX_WRITE_DEPTH}) — a hook is "
+                f"likely calling arc.relay.save()/save_many()/delete()/delete_many() "
+                f"on itself, directly or indirectly, with no base case that stops it.",
+                status=500,
+                code="write_recursion_limit",
+            )
+        depth_token = _write_depth.set(depth + 1)
+        try:
+            async with self._connection(new_transaction=new_transaction) as conn:
+                token = _active_conn.set(conn)
+                try:
+                    yield conn
+                finally:
+                    _active_conn.reset(token)
+        finally:
+            _write_depth.reset(depth_token)
+
+    @contextlib.asynccontextmanager
+    async def _postcommit_scope(self, *, new_transaction: bool, dry_run: bool):
+        """Defers after_commit/on_rollback until the OUTERMOST write
+        transaction has genuinely resolved, and yields the list this write
+        records its own outcome into.
+
+        The bug this exists to fix: every write used to run its own
+        post-commit hooks as soon as its `async with self._write_transaction(...)`
+        block ended. For an outermost write that is correct — the block
+        ending means the transaction committed. For a NESTED write (a hook
+        calling arc.relay.save()) it means nothing at all: the nested call
+        shares the outer connection, so asyncpg turned its transaction()
+        into a mere SAVEPOINT, and the real transaction is still open and
+        can still roll back. after_commit — the one hook whose entire
+        contract is "this data is durable now, it is safe to tell the
+        outside world" — therefore fired for rows that then vanished.
+        Confirmed against real Postgres: an outer save whose before_save
+        hook did a nested save and then raised left the nested row's
+        after_commit hook fired and the table empty. Sending a confirmation
+        email for an order that no longer exists is exactly the failure
+        this shape produces. The mirror was just as wrong: the nested
+        write's on_rollback never fired, so nothing ever corrected it.
+
+        The rule now, stated once: a write records WHETHER IT ITSELF
+        succeeded; the outermost transaction decides WHICH event that
+        becomes.
+          * outer committed + this write succeeded -> after_commit
+          * outer committed + this write failed    -> on_rollback (its own
+            SAVEPOINT rolled back, but the outer legitimately carried on)
+          * outer rolled back                      -> on_rollback for every
+            entry, whatever each one's own outcome was — nothing persisted
+        A dry run flushes nothing at all: after_commit must not fire
+        (nothing committed) and on_rollback must not either (nothing
+        failed) — unchanged from the previous behavior, just centralized.
+
+        `outermost` is computed BEFORE _write_transaction() runs, since
+        that is what sets _active_conn in the first place; new_transaction
+        =True always means outermost, because it acquires its own separate
+        connection and is therefore its own real transaction."""
+        outermost = new_transaction or _active_conn.get() is None
+        token = _postcommit_queue.set([]) if outermost else None
+        deferred = _postcommit_queue.get()
+        if deferred is None:  # defensive — only reachable if a caller nulls it mid-write
+            deferred = []
+        try:
+            yield deferred
+        except BaseException as exc:
+            if outermost and not dry_run:
+                await self._flush_postcommit(deferred, committed=False, error=exc)
+            raise
+        else:
+            if outermost and not dry_run:
+                await self._flush_postcommit(deferred, committed=True, error=None)
+        finally:
+            if token is not None:
+                _postcommit_queue.reset(token)
+
+    async def _flush_postcommit(
+        self, deferred: list, *, committed: bool, error: BaseException | None
+    ) -> None:
+        """Runs every deferred entry's real post-commit event, in the order
+        the writes happened. `error` is the outermost failure, attached to
+        any entry that succeeded on its own but is being rolled back by it
+        — otherwise a hook asking "why am I being told this rolled back?"
+        would find ctx.error empty for the one case where the answer is
+        most useful."""
+        for table, ctx, succeeded in deferred:
+            if committed and succeeded:
+                event: HookEvent = "after_commit"
+            else:
+                event = "on_rollback"
+                if ctx.error is None:
+                    ctx.error = error
+            await self._run_hooks_resolved(table, event, ctx)
 
     @contextlib.asynccontextmanager
     async def _transaction_or_dry_run(self, conn: Any, dry_run: bool):
@@ -770,24 +1127,26 @@ class RelayProvider:
         ctx = HookContext(table=table, old=None, payload=dict(data))
         ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
         dry_run = _dry_run.get()
-        async with self._write_transaction(new_transaction=new_transaction) as conn:
-            try:
-                async with self._transaction_or_dry_run(conn, dry_run):
-                    ctx.conn = conn
-                    await self._run_hooks(table, "validate", ctx)
-                    await self._run_hooks(table, "before_save", ctx)
-                    row = await self._psqldb.insert(table, ctx.payload, created_by=by, conn=conn)
-                    ctx.new = row  # psqldb.insert() already returns a plain dict
-                    ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
-                    await self._run_hooks(table, "after_save", ctx)
-            except Exception as exc:
+        async with self._postcommit_scope(
+            new_transaction=new_transaction, dry_run=dry_run
+        ) as deferred:
+            async with self._write_transaction(new_transaction=new_transaction) as conn:
+                try:
+                    async with self._transaction_or_dry_run(conn, dry_run):
+                        ctx.conn = conn
+                        await self._run_hooks(table, "validate", ctx)
+                        await self._run_hooks(table, "before_save", ctx)
+                        row = await self._psqldb.insert(table, ctx.payload, created_by=by, conn=conn)
+                        ctx.new = row  # psqldb.insert() already returns a plain dict
+                        ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
+                        await self._run_hooks(table, "after_save", ctx)
+                except Exception as exc:
+                    ctx.conn = None
+                    ctx.error = exc
+                    deferred.append((table, ctx, False))
+                    raise
                 ctx.conn = None
-                ctx.error = exc
-                await self._run_hooks_resolved(table, "on_rollback", ctx)
-                raise
-            ctx.conn = None
-        if not dry_run:
-            await self._run_hooks_resolved(table, "after_commit", ctx)
+            deferred.append((table, ctx, True))
         return ctx.new
 
     async def _update(
@@ -802,31 +1161,81 @@ class RelayProvider:
         self._psqldb.schema(table)
         ctx = HookContext(table=table, payload=dict(data))
         dry_run = _dry_run.get()
-        async with self._write_transaction(new_transaction=new_transaction) as conn:
-            try:
-                async with self._transaction_or_dry_run(conn, dry_run):
-                    ctx.conn = conn
-                    if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
-                        # psqldb.get() already returns a plain dict (or None)
-                        ctx.old = await self._psqldb.get(table, id, conn=conn)
-                    ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
-                    await self._run_hooks(table, "validate", ctx)
-                    await self._run_hooks(table, "before_save", ctx)
-                    # psqldb.update() already returns a plain dict (or None)
-                    ctx.new = await self._psqldb.update(
-                        table, id, ctx.payload, updated_by=by, conn=conn
-                    )
-                    ctx.doc = _postwrite_doc(ctx.new, ctx.doc.old, is_new=False)
-                    await self._run_hooks(table, "after_save", ctx)
-            except Exception as exc:
+        async with self._postcommit_scope(
+            new_transaction=new_transaction, dry_run=dry_run
+        ) as deferred:
+            async with self._write_transaction(new_transaction=new_transaction) as conn:
+                try:
+                    async with self._transaction_or_dry_run(conn, dry_run):
+                        ctx.conn = conn
+                        if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
+                            # psqldb.get() already returns a plain dict (or None)
+                            ctx.old = await self._psqldb.get(table, id, conn=conn)
+                        ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
+                        await self._run_hooks(table, "validate", ctx)
+                        await self._run_hooks(table, "before_save", ctx)
+                        # psqldb.update() already returns a plain dict (or None)
+                        ctx.new = await self._psqldb.update(
+                            table, id, ctx.payload, updated_by=by, conn=conn
+                        )
+                        ctx.doc = _postwrite_doc(ctx.new, ctx.doc.old, is_new=False)
+                        await self._run_hooks(table, "after_save", ctx)
+                except Exception as exc:
+                    ctx.conn = None
+                    ctx.error = exc
+                    deferred.append((table, ctx, False))
+                    raise
                 ctx.conn = None
-                ctx.error = exc
-                await self._run_hooks_resolved(table, "on_rollback", ctx)
-                raise
-            ctx.conn = None
-        if not dry_run:
-            await self._run_hooks_resolved(table, "after_commit", ctx)
+            deferred.append((table, ctx, True))
         return ctx.new
+
+    def _match_on_is_constraint_backed(self, table: str, match_on: list[str]) -> bool:
+        """Whether `match_on` is backed by a REAL Postgres constraint —
+        either a single field declared `"unique": true`, or an exact
+        `unique_together` group (field set match, order-independent) — as
+        opposed to an arbitrary set of columns with no database-level
+        guarantee behind them at all. See save()'s own docstring for what
+        this changes."""
+        schema = self._psqldb.schema(table)
+        if len(match_on) == 1:
+            only = match_on[0]
+            if any(f.name == only and f.unique for f in schema.fields):
+                return True
+        match_set = set(match_on)
+        return any(set(ut["fields"]) == match_set for ut in schema.unique_together)
+
+    async def _resolve_match_on(
+        self,
+        table: str,
+        data: dict,
+        match_on: list[str],
+        filters: dict,
+        *,
+        by: str | None,
+        new_transaction: bool,
+    ) -> dict:
+        """The shared lookup-then-branch body save() runs either with or
+        without its own lock wrapped around it — see save() for which."""
+        matches = await self.list(
+            table, filters=filters, fields=["id"], limit=2, new_transaction=new_transaction
+        )
+        if len(matches) > 1:
+            raise query.QueryError(
+                f"save(): match_on {filters} matched more than one row on '{table}' — "
+                f"save() only ever affects exactly one row; use save_many() for a bulk match."
+            )
+        if matches:
+            payload = {k: v for k, v in data.items() if k not in match_on}
+            return await self._update(
+                table, matches[0]["id"], payload, by=by, new_transaction=new_transaction
+            )
+        # The insert MUST happen while any lock the caller took is still
+        # held — it used to sit after this block, so the lock was released
+        # between "saw no match" and "inserted", and two concurrent saves
+        # could both reach here and both insert: the exact race the lock
+        # exists to prevent for a match_on with no real constraint behind it.
+        payload = {k: v for k, v in data.items() if k != "id"}
+        return await self._insert(table, payload, by=by, new_transaction=new_transaction)
 
     async def save(
         self,
@@ -849,16 +1258,33 @@ class RelayProvider:
         for an intentional fan-out. Neither id nor match_on -> plain
         insert.
 
-        match_on doesn't have to name a DB-unique field — if you want that
-        enforced even for direct create()/save() calls bypassing this
-        lookup, that's a `validate` hook's job, not this method's. What
-        THIS method guarantees on its own: the ENTIRE lookup-then-branch
-        sequence — including the no-match insert — runs inside one
+        match_on doesn't have to name a DB-unique field or a declared
+        `unique_together` group — if you want that enforced even for
+        direct create()/save() calls bypassing this lookup, that's a
+        `validate` hook's job, not this method's. When it ISN'T backed by
+        a real constraint, this method guarantees the ENTIRE lookup-then-
+        branch sequence — including the no-match insert — runs inside one
         arc.relay.lock(), so two concurrent save() calls for the SAME
         match_on values can't both see "no match" and both insert — the
         classic upsert race. (Real guarantee with redix installed; same
         weaker in-process-only fallback as every other arc.relay.lock()
         use otherwise — see lock()'s own docstring.)
+
+        When match_on DOES exactly match a declared unique field or
+        `unique_together` group, the lock is skipped entirely — Postgres's
+        own constraint already guarantees no duplicate can exist, in every
+        process, lock or no lock, which is a STRONGER guarantee than the
+        in-process-only fallback lock ever gave without redix installed
+        (two callers in two different Gateway worker processes could
+        previously race past it and create a genuine duplicate row). The
+        rare loser of that race now gets a friendly `ValidationError`
+        (psqldb.validation.friendly_unique_error) instead of a lock wait —
+        not a single atomic statement (this is still select-then-branch,
+        just without the lock), a deliberate, smaller-scope fix: a true
+        one-statement `INSERT ... ON CONFLICT` upsert would need to decide
+        insert-vs-update before precommit hooks run, which breaks their
+        existing `ctx.old`/`doc.is_new` contract — left as a documented,
+        separate future increment, not silently attempted here.
         """
         if data.get("id") is not None:
             payload = {k: v for k, v in data.items() if k != "id"}
@@ -874,30 +1300,17 @@ class RelayProvider:
 
         if match_on:
             filters = {f: data[f] for f in match_on}
+            if self._match_on_is_constraint_backed(table, match_on):
+                return await self._resolve_match_on(
+                    table, data, match_on, filters, by=by, new_transaction=new_transaction
+                )
             # str() every value so the same logical key always locks the same
             # name regardless of how the caller spelled it (UUID vs str, ...).
             lock_key = f"relay:save:{table}:{sorted((k, str(v)) for k, v in filters.items())}"
             async with self.lock(lock_key):
-                matches = await self.list(
-                    table, filters=filters, fields=["id"], limit=2, new_transaction=new_transaction
+                return await self._resolve_match_on(
+                    table, data, match_on, filters, by=by, new_transaction=new_transaction
                 )
-                if len(matches) > 1:
-                    raise query.QueryError(
-                        f"save(): match_on {filters} matched more than one row on '{table}' — "
-                        f"save() only ever affects exactly one row; use save_many() for a bulk match."
-                    )
-                if matches:
-                    payload = {k: v for k, v in data.items() if k not in match_on}
-                    return await self._update(
-                        table, matches[0]["id"], payload, by=by, new_transaction=new_transaction
-                    )
-                # The insert MUST happen while the lock is still held — it used
-                # to sit after this block, so the lock was released between
-                # "saw no match" and "inserted", and two concurrent saves could
-                # both reach here and both insert: the exact race the lock
-                # exists to prevent.
-                payload = {k: v for k, v in data.items() if k != "id"}
-                return await self._insert(table, payload, by=by, new_transaction=new_transaction)
 
         payload = {k: v for k, v in data.items() if k != "id"}
         return await self._insert(table, payload, by=by, new_transaction=new_transaction)
@@ -908,25 +1321,73 @@ class RelayProvider:
         self._psqldb.schema(table)
         ctx = HookContext(table=table)
         dry_run = _dry_run.get()
-        async with self._write_transaction(new_transaction=new_transaction) as conn:
-            try:
-                async with self._transaction_or_dry_run(conn, dry_run):
-                    ctx.conn = conn
-                    if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
-                        # psqldb.get() already returns a plain dict (or None)
-                        ctx.old = await self._psqldb.get(table, id, conn=conn)
-                    ctx.doc = _delete_doc(ctx.old)
-                    await self._run_hooks(table, "before_delete", ctx)
-                    await self._psqldb.soft_delete(table, id, deleted_by=by, conn=conn)
-                    await self._run_hooks(table, "after_delete", ctx)
-            except Exception as exc:
+        async with self._postcommit_scope(
+            new_transaction=new_transaction, dry_run=dry_run
+        ) as deferred:
+            async with self._write_transaction(new_transaction=new_transaction) as conn:
+                try:
+                    async with self._transaction_or_dry_run(conn, dry_run):
+                        ctx.conn = conn
+                        if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
+                            # psqldb.get() already returns a plain dict (or None)
+                            ctx.old = await self._psqldb.get(table, id, conn=conn)
+                        ctx.doc = _delete_doc(ctx.old)
+                        await self._run_hooks(table, "before_delete", ctx)
+                        await self._psqldb.soft_delete(table, id, deleted_by=by, conn=conn)
+                        await self._run_hooks(table, "after_delete", ctx)
+                except Exception as exc:
+                    ctx.conn = None
+                    ctx.error = exc
+                    deferred.append((table, ctx, False))
+                    raise
                 ctx.conn = None
-                ctx.error = exc
-                await self._run_hooks_resolved(table, "on_rollback", ctx)
-                raise
-            ctx.conn = None
-        if not dry_run:
-            await self._run_hooks_resolved(table, "after_commit", ctx)
+            deferred.append((table, ctx, True))
+
+    def all_columns(self, table: str) -> list[str]:
+        """Every real column's name on `table` — for the internal, never-
+        returned-to-a-client callers that genuinely need the full row
+        (most single-row lookups a hook or an API function does purely to
+        read a few of its OWN fields back out in Python, e.g. authn
+        reading `password_hash` off `_users` to verify a login). `fields`
+        is required on every read now (see query.build_select) — this is
+        the explicit, greppable way to say "give me everything," visibly
+        different from a caller that names a short, deliberate list
+        because it actually only needs a few columns and is about to hand
+        the result to an untrusted response body. Prefer naming exact
+        fields wherever the caller can — this exists so a call site that
+        genuinely needs the whole row isn't forced to hand-copy and
+        maintain its own column list that silently goes stale the next
+        time that schema changes."""
+        return [f.name for f in self._psqldb.schema(table).column_fields()]
+
+    def _resolve_and_cap_list_limit(self, limit: Any) -> int | None:
+        """The one place list()/list_page()'s `limit` argument is turned
+        into a concrete value — see the module-level RELAY_LIST_*_KEY
+        settings and _UNSET_LIMIT for the full reasoning.
+
+          * not given at all (_UNSET_LIMIT) -> the configured default.
+          * explicit `None` -> unchanged: unconditionally unbounded, a
+            developer's own deliberate choice, never client-reachable.
+          * any other explicit value -> checked against the configured
+            max, raising a clear QueryError rather than a silent
+            truncation if it's over.
+
+        Deliberately a plain method on RelayProvider, not a check inside
+        query.py's build_select — query.py stays a pure function of
+        (schema, arguments) with no settings/config dependency at all
+        (its own module docstring), and this check only ever applies to
+        list()/list_page() specifically, never to get()'s internal
+        limit=1 or to save()/save_many()'s own match_on resolution
+        lookups, which are a different, already-bounded concern."""
+        if limit is _UNSET_LIMIT:
+            return self._list_default_limit
+        if limit is not None and limit > self._list_max_limit:
+            raise query.QueryError(
+                f"limit {limit} exceeds the maximum of {self._list_max_limit} allowed "
+                f"(see the '{RELAY_LIST_MAX_LIMIT_KEY}' setting) — pass limit=None if "
+                f"you genuinely need every matching row."
+            )
+        return limit
 
     # ------------------------------------------------------------------ #
     # Query Engine (docs/arc.MD §3.4) — get/list/count/aggregate all funnel
@@ -947,10 +1408,13 @@ class RelayProvider:
         """Single row, by id (`key` a UUID/str) or by any other field(s)
         (`key` a dict of equality filters, first match) — replaces the old
         separate get()/get_by(). `fields` is the same query-engine-native
-        projection list() takes, including arc.relay.resolve(...) entries:
+        projection list() takes, including arc.relay.resolve(...) entries
+        — REQUIRED, no wildcard (see query.build_select): name the exact
+        columns you want, or pass arc.relay.all_columns(table) for the
+        whole row.
 
-            await arc.relay.get("employee", employee_id)                     # by id
-            await arc.relay.get("employee", {"employee_code": "E001"})       # by any field
+            await arc.relay.get("employee", employee_id, ["full_name"])       # by id
+            await arc.relay.get("employee", {"employee_code": "E001"}, ["full_name"])
             await arc.relay.get("employee", {"employee_code": "E001"},
                                  ["full_name", arc.relay.resolve("department", ["dept_name", "code"])])
         """
@@ -975,24 +1439,27 @@ class RelayProvider:
         filters: dict[str, Any] | None = None,
         fields: list[str | query.Resolve | FieldResolver] | None = None,
         order_by: list[str] | None = None,
-        limit: int | None = DEFAULT_LIST_LIMIT,
+        limit: int | None = _UNSET_LIMIT,
         offset: int = 0,
         distinct: bool = False,
         new_transaction: bool = False,
     ) -> list[dict]:
-        """Multiple rows, capped at DEFAULT_LIST_LIMIT (1000) unless told
-        otherwise — protects the caller's future self from the day a table
-        that used to be small enough to fetch whole isn't anymore. Pass an
-        explicit `limit` to change the cap, or `limit=None` to mean it
-        literally: fetch everything that matches `filters`, no cap at all —
-        still available, just no longer the default."""
+        """Multiple rows, capped at the configured default (20 out of the
+        box, `relay_list_default_limit` setting) unless told otherwise —
+        protects the caller's future self from the day a table that used
+        to be small enough to fetch whole isn't anymore. Pass an explicit
+        `limit` to change the cap for this call (rejected with a clear
+        QueryError past the configured max — `relay_list_max_limit`,
+        1000 out of the box), or `limit=None` to mean it literally: fetch
+        everything that matches `filters`, no cap at all — still
+        available, just no longer the default."""
         self._psqldb.schema(table)
         return await self._select(
             table,
             filters=filters,
             fields=fields,
             order_by=order_by,
-            limit=limit,
+            limit=self._resolve_and_cap_list_limit(limit),
             offset=offset,
             distinct=distinct,
             new_transaction=new_transaction,
@@ -1026,22 +1493,20 @@ class RelayProvider:
         async with self._connection(new_transaction=new_transaction) as conn:
             rows = await conn.fetch(sql, *params)
         shaped = [self._shape_row(dict(r), fields) for r in rows]
-        if fields:
-            await self._resolve_fields(shaped, fields)
+        await self._resolve_fields(shaped, fields)
         return shaped
 
     @staticmethod
-    def _shape_row(flat: dict, fields: list[str | query.Resolve | FieldResolver] | None) -> dict:
-        """SELECT * (fields=None) returns the flat row unchanged, same as
-        every other CRUD method. An explicit `fields` list re-nests each
-        arc.relay.resolve(...) entry's flat "field.subfield" column aliases
-        back into row[field] = {subfield: value, ...}; a FieldResolver
-        entry (e.g. arc.filer.url(...)) passes its raw column value
-        through unchanged here — _resolve_fields overwrites it with the
-        resolved value afterward. Everything else (plain column names)
-        passes through as a top-level key."""
-        if fields is None:
-            return flat
+    def _shape_row(flat: dict, fields: list[str | query.Resolve | FieldResolver]) -> dict:
+        """Re-nests each arc.relay.resolve(...) entry's flat
+        "field.subfield" column aliases back into row[field] = {subfield:
+        value, ...}; a FieldResolver entry (e.g. arc.filer.url(...)) passes
+        its raw column value through unchanged here — _resolve_fields
+        overwrites it with the resolved value afterward. Everything else
+        (plain column names) passes through as a top-level key. `fields`
+        is always a real, non-empty list by the time this runs —
+        query.build_select already rejects None/[] before either caller
+        (_select/list_page) reaches this call."""
         out: dict[str, Any] = {}
         for item in fields:
             if isinstance(item, query.Resolve):
@@ -1087,7 +1552,7 @@ class RelayProvider:
         filters: dict[str, Any] | None = None,
         fields: list[str | query.Resolve | FieldResolver] | None = None,
         order_by: list[str] | None = None,
-        limit: int | None = DEFAULT_LIST_LIMIT,
+        limit: int | None = _UNSET_LIMIT,
         offset: int = 0,
         distinct: bool = False,
         new_transaction: bool = False,
@@ -1120,6 +1585,7 @@ class RelayProvider:
         only if profiling ever shows the extra round-trip actually
         matters)."""
         schema = self._psqldb.schema(table)
+        limit = self._resolve_and_cap_list_limit(limit)
         select_sql, select_params = query.build_select(
             table,
             schema,
@@ -1139,8 +1605,7 @@ class RelayProvider:
             rows = await conn.fetch(select_sql, *select_params)
             total = await conn.fetchval(count_sql, *count_params)
         shaped = [self._shape_row(dict(r), fields) for r in rows]
-        if fields:
-            await self._resolve_fields(shaped, fields)
+        await self._resolve_fields(shaped, fields)
         return shaped, total
 
     async def aggregate(
@@ -1225,32 +1690,34 @@ class RelayProvider:
         for ctx in ctxs:
             ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
         dry_run = _dry_run.get()
-        async with self._write_transaction(new_transaction=new_transaction) as conn:
-            try:
-                async with self._transaction_or_dry_run(conn, dry_run):
+        async with self._postcommit_scope(
+            new_transaction=new_transaction, dry_run=dry_run
+        ) as deferred:
+            async with self._write_transaction(new_transaction=new_transaction) as conn:
+                try:
+                    async with self._transaction_or_dry_run(conn, dry_run):
+                        for ctx in ctxs:
+                            ctx.conn = conn
+                            await self._run_hooks(table, "validate", ctx)
+                            await self._run_hooks(table, "before_save", ctx)
+                        results = await self._psqldb.insert_many(
+                            table, [ctx.payload for ctx in ctxs], created_by=by, conn=conn
+                        )
+                        for ctx, row in zip(ctxs, results):
+                            ctx.new = row  # psqldb.insert_many() already returns plain dicts
+                            ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
+                        for ctx in ctxs:
+                            await self._run_hooks(table, "after_save", ctx)
+                except Exception as exc:
                     for ctx in ctxs:
-                        ctx.conn = conn
-                        await self._run_hooks(table, "validate", ctx)
-                        await self._run_hooks(table, "before_save", ctx)
-                    results = await self._psqldb.insert_many(
-                        table, [ctx.payload for ctx in ctxs], created_by=by, conn=conn
-                    )
-                    for ctx, row in zip(ctxs, results):
-                        ctx.new = row  # psqldb.insert_many() already returns plain dicts
-                        ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
-                    for ctx in ctxs:
-                        await self._run_hooks(table, "after_save", ctx)
-            except Exception as exc:
+                        ctx.conn = None
+                        ctx.error = exc
+                        deferred.append((table, ctx, False))
+                    raise
                 for ctx in ctxs:
                     ctx.conn = None
-                    ctx.error = exc
-                    await self._run_hooks_resolved(table, "on_rollback", ctx)
-                raise
             for ctx in ctxs:
-                ctx.conn = None
-        if not dry_run:
-            for ctx in ctxs:
-                await self._run_hooks_resolved(table, "after_commit", ctx)
+                deferred.append((table, ctx, True))
         return [ctx.new for ctx in ctxs]
 
     async def _update_many(
@@ -1269,45 +1736,47 @@ class RelayProvider:
         ctxs = [HookContext(table=table, payload=dict(u["data"])) for u in updates]
         ids = [u["id"] for u in updates]
         dry_run = _dry_run.get()
-        async with self._write_transaction(new_transaction=new_transaction) as conn:
-            try:
-                async with self._transaction_or_dry_run(conn, dry_run):
-                    if need_old:
-                        old_rows = await self._psqldb.get_many(table, ids, conn=conn)
-                        # psqldb.get_many() already returns plain dicts
-                        old_by_id = {r["id"]: r for r in old_rows}
+        async with self._postcommit_scope(
+            new_transaction=new_transaction, dry_run=dry_run
+        ) as deferred:
+            async with self._write_transaction(new_transaction=new_transaction) as conn:
+                try:
+                    async with self._transaction_or_dry_run(conn, dry_run):
+                        if need_old:
+                            old_rows = await self._psqldb.get_many(table, ids, conn=conn)
+                            # psqldb.get_many() already returns plain dicts
+                            old_by_id = {r["id"]: r for r in old_rows}
+                            for ctx, row_id in zip(ctxs, ids):
+                                ctx.old = old_by_id.get(row_id)
+                        for ctx in ctxs:
+                            ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
+                        for ctx in ctxs:
+                            ctx.conn = conn
+                            await self._run_hooks(table, "validate", ctx)
+                            await self._run_hooks(table, "before_save", ctx)
+                        results = await self._psqldb.update_many(
+                            table,
+                            [{"id": row_id, "data": ctx.payload} for row_id, ctx in zip(ids, ctxs)],
+                            updated_by=by,
+                            conn=conn,
+                        )
+                        # psqldb.update_many() already returns plain dicts
+                        results_by_id = {r["id"]: r for r in results}
                         for ctx, row_id in zip(ctxs, ids):
-                            ctx.old = old_by_id.get(row_id)
+                            ctx.new = results_by_id.get(row_id)
+                            ctx.doc = _postwrite_doc(ctx.new, ctx.doc.old, is_new=False)
+                        for ctx in ctxs:
+                            await self._run_hooks(table, "after_save", ctx)
+                except Exception as exc:
                     for ctx in ctxs:
-                        ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
-                    for ctx in ctxs:
-                        ctx.conn = conn
-                        await self._run_hooks(table, "validate", ctx)
-                        await self._run_hooks(table, "before_save", ctx)
-                    results = await self._psqldb.update_many(
-                        table,
-                        [{"id": row_id, "data": ctx.payload} for row_id, ctx in zip(ids, ctxs)],
-                        updated_by=by,
-                        conn=conn,
-                    )
-                    # psqldb.update_many() already returns plain dicts
-                    results_by_id = {r["id"]: r for r in results}
-                    for ctx, row_id in zip(ctxs, ids):
-                        ctx.new = results_by_id.get(row_id)
-                        ctx.doc = _postwrite_doc(ctx.new, ctx.doc.old, is_new=False)
-                    for ctx in ctxs:
-                        await self._run_hooks(table, "after_save", ctx)
-            except Exception as exc:
+                        ctx.conn = None
+                        ctx.error = exc
+                        deferred.append((table, ctx, False))
+                    raise
                 for ctx in ctxs:
                     ctx.conn = None
-                    ctx.error = exc
-                    await self._run_hooks_resolved(table, "on_rollback", ctx)
-                raise
             for ctx in ctxs:
-                ctx.conn = None
-        if not dry_run:
-            for ctx in ctxs:
-                await self._run_hooks_resolved(table, "after_commit", ctx)
+                deferred.append((table, ctx, True))
         return [ctx.new for ctx in ctxs]
 
     async def save_many(
@@ -1343,109 +1812,111 @@ class RelayProvider:
         insert_ctxs: list[HookContext] = []
         update_ctxs: list[HookContext] = []
         dry_run = _dry_run.get()
-        async with self._write_transaction(new_transaction=new_transaction) as conn:
-            try:
-                async with self._transaction_or_dry_run(conn, dry_run):
-                    resolved: list[tuple[str, UUID | None, dict]] = []
-                    for row in rows:
-                        row_id = row.get("id")
-                        if row_id is not None:
-                            resolved.append(
-                                ("update", row_id, {k: v for k, v in row.items() if k != "id"})
-                            )
-                            continue
-                        if match_on:
-                            filters = {f: row[f] for f in match_on}
-                            cap = (limit + 1) if limit is not None else None
-                            matches = await self._select(
-                                table,
-                                filters=filters,
-                                fields=["id"],
-                                order_by=None,
-                                limit=cap,
-                                offset=0,
-                                distinct=False,
-                            )
-                            if limit is not None and len(matches) > limit:
-                                raise query.QueryError(
-                                    f"save_many(): match_on {filters} matched more than "
-                                    f"limit={limit} row(s) on '{table}'."
+        async with self._postcommit_scope(
+            new_transaction=new_transaction, dry_run=dry_run
+        ) as deferred:
+            async with self._write_transaction(new_transaction=new_transaction) as conn:
+                try:
+                    async with self._transaction_or_dry_run(conn, dry_run):
+                        resolved: list[tuple[str, UUID | None, dict]] = []
+                        for row in rows:
+                            row_id = row.get("id")
+                            if row_id is not None:
+                                resolved.append(
+                                    ("update", row_id, {k: v for k, v in row.items() if k != "id"})
                                 )
-                            if matches:
-                                data = {k: v for k, v in row.items() if k not in match_on}
-                                for m in matches:
-                                    resolved.append(("update", m["id"], data))
                                 continue
-                        resolved.append(
-                            ("insert", None, {k: v for k, v in row.items() if k != "id"})
-                        )
+                            if match_on:
+                                filters = {f: row[f] for f in match_on}
+                                cap = (limit + 1) if limit is not None else None
+                                matches = await self._select(
+                                    table,
+                                    filters=filters,
+                                    fields=["id"],
+                                    order_by=None,
+                                    limit=cap,
+                                    offset=0,
+                                    distinct=False,
+                                )
+                                if limit is not None and len(matches) > limit:
+                                    raise query.QueryError(
+                                        f"save_many(): match_on {filters} matched more than "
+                                        f"limit={limit} row(s) on '{table}'."
+                                    )
+                                if matches:
+                                    data = {k: v for k, v in row.items() if k not in match_on}
+                                    for m in matches:
+                                        resolved.append(("update", m["id"], data))
+                                    continue
+                            resolved.append(
+                                ("insert", None, {k: v for k, v in row.items() if k != "id"})
+                            )
 
-                    for kind, _rid, data in resolved:
-                        if kind == "insert":
-                            ctx = HookContext(table=table, old=None, payload=dict(data))
-                            ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
-                            insert_ctxs.append(ctx)
-                    update_targets = [
-                        (rid, data) for kind, rid, data in resolved if kind == "update"
-                    ]
-                    for _rid, data in update_targets:
-                        update_ctxs.append(HookContext(table=table, payload=dict(data)))
+                        for kind, _rid, data in resolved:
+                            if kind == "insert":
+                                ctx = HookContext(table=table, old=None, payload=dict(data))
+                                ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
+                                insert_ctxs.append(ctx)
+                        update_targets = [
+                            (rid, data) for kind, rid, data in resolved if kind == "update"
+                        ]
+                        for _rid, data in update_targets:
+                            update_ctxs.append(HookContext(table=table, payload=dict(data)))
 
-                    need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
-                    if need_old and update_targets:
-                        old_rows = await self._psqldb.get_many(
-                            table, [rid for rid, _ in update_targets], conn=conn
-                        )
-                        # psqldb.get_many() already returns plain dicts
-                        old_by_id = {r["id"]: r for r in old_rows}
-                        for ctx, (rid, _data) in zip(update_ctxs, update_targets):
-                            ctx.old = old_by_id.get(rid)
-                    for ctx in update_ctxs:
-                        ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
+                        need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
+                        if need_old and update_targets:
+                            old_rows = await self._psqldb.get_many(
+                                table, [rid for rid, _ in update_targets], conn=conn
+                            )
+                            # psqldb.get_many() already returns plain dicts
+                            old_by_id = {r["id"]: r for r in old_rows}
+                            for ctx, (rid, _data) in zip(update_ctxs, update_targets):
+                                ctx.old = old_by_id.get(rid)
+                        for ctx in update_ctxs:
+                            ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
 
-                    all_ctxs = [*insert_ctxs, *update_ctxs]
-                    for ctx in all_ctxs:
-                        ctx.conn = conn
-                        await self._run_hooks(table, "validate", ctx)
-                        await self._run_hooks(table, "before_save", ctx)
+                        all_ctxs = [*insert_ctxs, *update_ctxs]
+                        for ctx in all_ctxs:
+                            ctx.conn = conn
+                            await self._run_hooks(table, "validate", ctx)
+                            await self._run_hooks(table, "before_save", ctx)
 
-                    if insert_ctxs:
-                        results = await self._psqldb.insert_many(
-                            table, [c.payload for c in insert_ctxs], created_by=by, conn=conn
-                        )
-                        # psqldb.insert_many() already returns plain dicts
-                        for c, r in zip(insert_ctxs, results):
-                            c.new = r
-                            c.doc = _postwrite_doc(c.new, None, is_new=True)
-                    if update_ctxs:
-                        results = await self._psqldb.update_many(
-                            table,
-                            [
-                                {"id": rid, "data": c.payload}
-                                for (rid, _d), c in zip(update_targets, update_ctxs)
-                            ],
-                            updated_by=by,
-                            conn=conn,
-                        )
-                        # psqldb.update_many() already returns plain dicts
-                        results_by_id = {r["id"]: r for r in results}
-                        for (rid, _d), c in zip(update_targets, update_ctxs):
-                            c.new = results_by_id.get(rid)
-                            c.doc = _postwrite_doc(c.new, c.doc.old, is_new=False)
+                        if insert_ctxs:
+                            results = await self._psqldb.insert_many(
+                                table, [c.payload for c in insert_ctxs], created_by=by, conn=conn
+                            )
+                            # psqldb.insert_many() already returns plain dicts
+                            for c, r in zip(insert_ctxs, results):
+                                c.new = r
+                                c.doc = _postwrite_doc(c.new, None, is_new=True)
+                        if update_ctxs:
+                            results = await self._psqldb.update_many(
+                                table,
+                                [
+                                    {"id": rid, "data": c.payload}
+                                    for (rid, _d), c in zip(update_targets, update_ctxs)
+                                ],
+                                updated_by=by,
+                                conn=conn,
+                            )
+                            # psqldb.update_many() already returns plain dicts
+                            results_by_id = {r["id"]: r for r in results}
+                            for (rid, _d), c in zip(update_targets, update_ctxs):
+                                c.new = results_by_id.get(rid)
+                                c.doc = _postwrite_doc(c.new, c.doc.old, is_new=False)
 
-                    for ctx in all_ctxs:
-                        await self._run_hooks(table, "after_save", ctx)
-            except Exception as exc:
+                        for ctx in all_ctxs:
+                            await self._run_hooks(table, "after_save", ctx)
+                except Exception as exc:
+                    for ctx in [*insert_ctxs, *update_ctxs]:
+                        ctx.conn = None
+                        ctx.error = exc
+                        deferred.append((table, ctx, False))
+                    raise
                 for ctx in [*insert_ctxs, *update_ctxs]:
                     ctx.conn = None
-                    ctx.error = exc
-                    await self._run_hooks_resolved(table, "on_rollback", ctx)
-                raise
             for ctx in [*insert_ctxs, *update_ctxs]:
-                ctx.conn = None
-        if not dry_run:
-            for ctx in [*insert_ctxs, *update_ctxs]:
-                await self._run_hooks_resolved(table, "after_commit", ctx)
+                deferred.append((table, ctx, True))
         return [ctx.new for ctx in [*insert_ctxs, *update_ctxs]]
 
     async def delete_many(
@@ -1457,34 +1928,36 @@ class RelayProvider:
         need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
         ctxs = [HookContext(table=table) for _ in ids]
         dry_run = _dry_run.get()
-        async with self._write_transaction(new_transaction=new_transaction) as conn:
-            try:
-                async with self._transaction_or_dry_run(conn, dry_run):
-                    if need_old:
-                        old_rows = await self._psqldb.get_many(table, ids, conn=conn)
-                        # psqldb.get_many() already returns plain dicts
-                        old_by_id = {r["id"]: r for r in old_rows}
-                        for ctx, row_id in zip(ctxs, ids):
-                            ctx.old = old_by_id.get(row_id)
+        async with self._postcommit_scope(
+            new_transaction=new_transaction, dry_run=dry_run
+        ) as deferred:
+            async with self._write_transaction(new_transaction=new_transaction) as conn:
+                try:
+                    async with self._transaction_or_dry_run(conn, dry_run):
+                        if need_old:
+                            old_rows = await self._psqldb.get_many(table, ids, conn=conn)
+                            # psqldb.get_many() already returns plain dicts
+                            old_by_id = {r["id"]: r for r in old_rows}
+                            for ctx, row_id in zip(ctxs, ids):
+                                ctx.old = old_by_id.get(row_id)
+                        for ctx in ctxs:
+                            ctx.doc = _delete_doc(ctx.old)
+                        for ctx in ctxs:
+                            ctx.conn = conn
+                            await self._run_hooks(table, "before_delete", ctx)
+                        await self._psqldb.soft_delete_many(table, ids, deleted_by=by, conn=conn)
+                        for ctx in ctxs:
+                            await self._run_hooks(table, "after_delete", ctx)
+                except Exception as exc:
                     for ctx in ctxs:
-                        ctx.doc = _delete_doc(ctx.old)
-                    for ctx in ctxs:
-                        ctx.conn = conn
-                        await self._run_hooks(table, "before_delete", ctx)
-                    await self._psqldb.soft_delete_many(table, ids, deleted_by=by, conn=conn)
-                    for ctx in ctxs:
-                        await self._run_hooks(table, "after_delete", ctx)
-            except Exception as exc:
+                        ctx.conn = None
+                        ctx.error = exc
+                        deferred.append((table, ctx, False))
+                    raise
                 for ctx in ctxs:
                     ctx.conn = None
-                    ctx.error = exc
-                    await self._run_hooks_resolved(table, "on_rollback", ctx)
-                raise
             for ctx in ctxs:
-                ctx.conn = None
-        if not dry_run:
-            for ctx in ctxs:
-                await self._run_hooks_resolved(table, "after_commit", ctx)
+                deferred.append((table, ctx, True))
 
     # ------------------------------------------------------------------ #
     # Whitelisting — plugins/<plugin>/api/*.py, same controlled-loading
@@ -1673,6 +2146,7 @@ class RelayProvider:
                 wants_client_ip="client_ip" in sig.parameters,
                 wants_cookies="cookies" in sig.parameters,
                 wants_request="request" in sig.parameters,
+                wants_request_id="request_id" in sig.parameters,
                 wants_dry_run="dry_run" in sig.parameters,
                 signature=sig,
                 max_body_bytes=max_body_bytes,
@@ -1817,6 +2291,7 @@ class RelayProvider:
             # remove: the request-time 403 below was ALREADY correct).
             identity = getattr(request, "identity", None)
             caller_roles = set(getattr(identity, "roles", None) or [])
+            request_id = getattr(request, "request_id", None)
             if "*" in wf.roles:
                 authorized = identity is not None
             elif "*" in caller_roles:
@@ -1909,6 +2384,8 @@ class RelayProvider:
                 kwargs["cookies"] = getattr(request, "cookies", {})
             if wf.wants_request:
                 kwargs["request"] = request
+            if wf.wants_request_id:
+                kwargs["request_id"] = request_id
             if wf.wants_dry_run:
                 kwargs["dry_run"] = dry_run_signal
             if wf.payload_type is not None:
@@ -1951,13 +2428,24 @@ class RelayProvider:
                 wf.signature.bind(**kwargs)
             except TypeError as exc:
                 raise HTTPError(400, {"error": "invalid arguments", "detail": str(exc)}) from exc
+            # Ambient "who/which request" for everything downstream of this
+            # call — hooks, nested writes, and (deliberately, unlike every
+            # other contextvar here) any background job enqueued during it.
+            # Built from server-resolved values only, never from kwargs.
+            call_ctx = CallContext(
+                request_id=request_id,
+                user=getattr(identity, "email", None),
+                roles=tuple(sorted(caller_roles)),
+            )
             token = _dry_run.set(dry_run_signal)
+            ctx_token = _call_context.set(call_ctx)
             try:
                 result = await wf.fn(**kwargs)
             except RelayError as exc:
                 raise HTTPError(exc.status, {"error": exc.message, "code": exc.code}) from exc
             finally:
                 _dry_run.reset(token)
+                _call_context.reset(ctx_token)
             if isinstance(result, RelayStream):
                 # A stream is a live read, not a write whose outcome needs
                 # hiding behind X-Dry-Run — GET already means "safe" for
@@ -1979,13 +2467,21 @@ class RelayProvider:
                 # — re-scoping it here, around the actual iteration, is
                 # what keeps the same guarantee dry_run gives every other
                 # whitelisted write.
+                # The CallContext is re-established here for exactly the
+                # same reason dry_run is: the streamed coroutine's real
+                # work happens during THIS iteration, long after the
+                # handler's own `finally` reset both. Without it, a job
+                # enqueued from inside a streamed function would lose the
+                # request_id/user that every other path carries.
                 async def _dry_run_scoped(stream: RelayStream):
                     inner_token = _dry_run.set(dry_run_signal)
+                    inner_ctx_token = _call_context.set(call_ctx)
                     try:
                         async for chunk in stream:
                             yield chunk
                     finally:
                         _dry_run.reset(inner_token)
+                        _call_context.reset(inner_ctx_token)
 
                 return StreamResponse(source=_dry_run_scoped(result))
             if isinstance(result, StreamResponse):
@@ -2072,6 +2568,19 @@ class RelayProvider:
                 k for k, (_v, exp) in self._local_cache.items() if exp is not None and now >= exp
             ]:
                 self._local_cache.pop(k, None)
+        # The sweep above only ever removes entries that have actually
+        # EXPIRED — a set of keys with no `ex` (or one that just hasn't
+        # come due yet) sails straight through it and grows forever, since
+        # this fallback is a plain process-lifetime dict with nothing else
+        # bounding it (unlike redix, which is Redis's own problem to size).
+        # Evict oldest-first (plain dict insertion order) once the cap is
+        # hit — not a real LRU (a cache_get doesn't move a key to the
+        # back), but enough to make "forever" actually mean something
+        # finite for the one deployment shape (no redix installed) this
+        # fallback exists for at all.
+        while len(self._local_cache) > _LOCAL_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(self._local_cache))
+            self._local_cache.pop(oldest_key, None)
 
     async def cache_delete(self, key: str) -> None:
         if self._redix is not None:
@@ -2155,7 +2664,25 @@ class RelayProvider:
         execution succeeds (there's no result backend wired up to report
         that back yet, docs/arc.MD §8). Either way this stays fire-and-
         forget from the caller's point of view — durable-fire-and-forget
-        instead of volatile-fire-and-forget."""
+        instead of volatile-fire-and-forget.
+
+        AMBIENT STATE (all three paths): the spawned task deliberately does
+        NOT inherit the enclosing request's database connection, dry-run
+        flag, deferred post-commit queue, or active stream — see
+        _detach_request_scoped_state() for why each one is actively harmful
+        to carry, and for the confirmed bug that used to result. It DOES
+        inherit the CallContext (request_id / user / roles), which is plain
+        immutable data and is what makes a queued job traceable back to the
+        request and user that queued it.
+
+        In the in-process fallback that context is carried by the
+        contextvar itself. The durable `lineup` paths hand the job to
+        another PROCESS entirely, where a contextvar cannot reach — so it
+        travels as data instead: lineup stamps `context_labels()` onto the
+        TaskIQ message it kicks, and the worker rebinds them via
+        `use_context_labels()` around the job before running it. Either
+        way the `_job_log` row records `request_id`/`triggered_by`, so the
+        trail survives even after the process that queued the job is gone."""
         if self._kernel.has("lineup"):
             lineup = self._kernel.get("lineup")
             if lineup.is_task(fn):
@@ -2166,9 +2693,17 @@ class RelayProvider:
                 )  # raises TypeError here, synchronously, before any Task exists
                 coro = lineup.enqueue_by_path(fn, *args, queue=queue, **kwargs)
 
+            async def _handoff() -> Any:
+                # Only pushes a message to Redis — but it still must not
+                # run holding the enclosing write's DB connection, and a
+                # handoff during a GET must not be silently dry-run'd into
+                # doing nothing. Same detachment as the fallback below.
+                self._detach_request_scoped_state()
+                return await coro
+
             # _track_task: most callers drop the returned Task — without a
             # strong reference here it could be GC-cancelled mid-handoff.
-            task = self._track_task(asyncio.create_task(coro))
+            task = self._track_task(asyncio.create_task(_handoff()))
 
             def _on_enqueue_done(t: asyncio.Task) -> None:
                 if t.cancelled():
@@ -2181,8 +2716,17 @@ class RelayProvider:
             return task
 
         started_at = datetime.now(timezone.utc)
+        # Captured HERE, in the caller's own context, not inside the task —
+        # _detach_request_scoped_state() deliberately leaves _call_context
+        # alone, so reading it inside would work too, but capturing it at
+        # the call site keeps the log row correct even if that ever changes.
+        call_ctx = self.context()
 
         async def _run_and_log() -> Any:
+            # FIRST statement in the task: drop the enclosing request's
+            # connection/dry-run/post-commit/stream state, keep the call
+            # context. See _detach_request_scoped_state()'s docstring.
+            self._detach_request_scoped_state()
             status, error = "success", None
             try:
                 return await fn(*args, **kwargs)
@@ -2210,6 +2754,12 @@ class RelayProvider:
                             "started_at": started_at,
                             "finished_at": finished_at,
                             "duration_ms": int((finished_at - started_at).total_seconds() * 1000),
+                            # Which request queued this, and as whom — the
+                            # whole point of carrying the CallContext across
+                            # the task boundary. Both NULL for a job with no
+                            # originating request (a CLI run, a test).
+                            "request_id": call_ctx.request_id,
+                            "triggered_by": call_ctx.user,
                         },
                     )
                 except Exception as log_exc:
@@ -2267,7 +2817,40 @@ def register(kernel: Any) -> None:
     # admin's Settings page (§3.5: declare once, by the owning plugin).
     kernel.settings.declare("job_log_retention_days")
 
-    provider = RelayProvider(kernel)
+    # list()/list_page()'s row cap — see the module-level constants' own
+    # docstring for the full split between "default" and "max". Plain
+    # settings, not secret: there's nothing sensitive about a row-count
+    # ceiling.
+    kernel.settings.declare(
+        RELAY_LIST_DEFAULT_LIMIT_KEY,
+        type=int,
+        default=DEFAULT_LIST_LIMIT,
+        doc="Row cap for arc.relay.list()/list_page() when the caller doesn't pass "
+        "`limit` at all. Pass limit=None on a specific call for a genuinely "
+        "unbounded read.",
+    )
+    kernel.settings.declare(
+        RELAY_LIST_MAX_LIMIT_KEY,
+        type=int,
+        default=MAX_LIST_LIMIT,
+        doc="Hard ceiling on any explicit `limit` passed to arc.relay.list()/"
+        "list_page() — a caller asking for more gets a clear QueryError, never a "
+        "silent truncation. Pass limit=None (never a large number) for an "
+        "intentionally unbounded read.",
+    )
+    list_default_limit = kernel.settings.get(RELAY_LIST_DEFAULT_LIMIT_KEY)
+    list_max_limit = kernel.settings.get(RELAY_LIST_MAX_LIMIT_KEY)
+    if list_default_limit > list_max_limit:
+        raise RuntimeError(
+            f"'{RELAY_LIST_DEFAULT_LIMIT_KEY}' ({list_default_limit}) is greater than "
+            f"'{RELAY_LIST_MAX_LIMIT_KEY}' ({list_max_limit}) — every ordinary "
+            f"list()/list_page() call (no explicit limit) would immediately exceed "
+            f"the configured maximum. Lower the default or raise the max."
+        )
+
+    provider = RelayProvider(
+        kernel, list_default_limit=list_default_limit, list_max_limit=list_max_limit
+    )
     if not kernel.has("redix"):
         kernel.advise(
             "redix not installed — arc.relay.cache_get/set/delete and arc.relay.lock() "
