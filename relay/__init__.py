@@ -565,6 +565,35 @@ _write_depth: ContextVar[int] = ContextVar("arc_relay_write_depth", default=0)
 # injection (WhitelistedFunction.wants_dry_run) if they choose to.
 _dry_run: ContextVar[bool] = ContextVar("arc_relay_dry_run", default=False)
 
+# Which hook events (if any) the CURRENTLY-EXECUTING save/save_many/delete/
+# delete_many call has asked to skip — set fresh (never unioned with
+# whatever was there before) at the top of each of those four methods and
+# reset in a finally, so it's scoped to exactly that one call, not "leaked"
+# to a nested arc.relay.* call one of its own (non-skipped) hooks happens to
+# make. A hook that itself calls save()/delete() again always starts from
+# an empty skip-set unless IT was also given its own skip_* flags — skipping
+# is an explicit, per-call opt-in, never silently inherited. Empty (the
+# default) means "skip nothing," today's original behavior, unchanged.
+_skip_hook_events: ContextVar[frozenset[str]] = ContextVar(
+    "arc_relay_skip_hook_events", default=frozenset()
+)
+
+
+def _resolve_skip_events(skip_hooks: bool, **flags: bool) -> frozenset[str]:
+    """Turns save()/save_many()/delete()/delete_many()'s own skip_hooks +
+    per-event skip_<event> kwargs into the frozenset _run_hooks/
+    _run_hooks_resolved/_has_hooks actually check. `skip_hooks=True` short-
+    circuits to every hook event that exists at all — harmless for, say,
+    save() to include before_delete/after_delete in that set, since those
+    can never fire from a save() call regardless. Otherwise, only the
+    individually-named flags that were actually passed True. One small
+    function rather than four copies of the same "which ones are True"
+    logic, one per write method."""
+    if skip_hooks:
+        return PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS
+    return frozenset(event for event, skip in flags.items() if skip)
+
+
 # Set only for the duration of arc.relay.stream()'s own internal coroutine-
 # driving loop (below) — read by arc.relay.publish() to find "the queue for
 # whatever stream is currently running in this task," if any. task-scoped
@@ -811,9 +840,12 @@ class RelayProvider:
         return self._decorator_for("on_rollback")
 
     def _has_hooks(self, table: str, events: frozenset[str]) -> bool:
-        return any((table, event) in self._hooks for event in events)
+        active = events - _skip_hook_events.get()
+        return any((table, event) in self._hooks for event in active)
 
     async def _run_hooks(self, table: str, event: HookEvent, ctx: HookContext) -> None:
+        if event in _skip_hook_events.get():
+            return
         for fn in self._hooks.get((table, event), ()):
             await fn(ctx)
 
@@ -826,6 +858,8 @@ class RelayProvider:
         (after_commit runs after a successful commit). Logged and
         swallowed; precommit hooks keep their raise-aborts-the-write
         semantics untouched via _run_hooks above."""
+        if event in _skip_hook_events.get():
+            return
         for fn in self._hooks.get((table, event), ()):
             try:
                 await fn(ctx)
@@ -1245,8 +1279,27 @@ class RelayProvider:
         match_on: list[str] | None = None,
         by: str | None = None,
         new_transaction: bool = False,
+        skip_hooks: bool = False,
+        skip_validate: bool = False,
+        skip_before_save: bool = False,
+        skip_after_save: bool = False,
+        skip_after_commit: bool = False,
+        skip_on_rollback: bool = False,
     ) -> dict:
         """Insert-or-update, one method (docs/relay/Sample.MD).
+
+        skip_hooks=True skips every hook this call would otherwise fire,
+        for a bulk/import-style caller that wants raw psqldb-speed writes
+        without losing save()'s own match_on/lock/upsert conveniences.
+        The individual skip_validate/skip_before_save/skip_after_save/
+        skip_after_commit/skip_on_rollback flags are for the narrower
+        case — e.g. "run validate (still reject bad data) but don't fire
+        after_save's side effects (an email, an event) for this one
+        import." Default is False/unset everywhere: nothing skipped,
+        today's original behavior, byte-for-byte. Scoped to exactly this
+        call — a hook this call itself triggers that makes its OWN nested
+        save()/delete() call does not inherit these flags; skipping is
+        explicit per call, never silently inherited.
 
         `data["id"]` present -> update that row directly, no match_on
         needed — a hard QueryError if no row has that id (a stale id
@@ -1286,62 +1339,104 @@ class RelayProvider:
         existing `ctx.old`/`doc.is_new` contract — left as a documented,
         separate future increment, not silently attempted here.
         """
-        if data.get("id") is not None:
+        skip = _resolve_skip_events(
+            skip_hooks,
+            validate=skip_validate,
+            before_save=skip_before_save,
+            after_save=skip_after_save,
+            after_commit=skip_after_commit,
+            on_rollback=skip_on_rollback,
+        )
+        token = _skip_hook_events.set(skip)
+        try:
+            if data.get("id") is not None:
+                payload = {k: v for k, v in data.items() if k != "id"}
+                updated = await self._update(
+                    table, data["id"], payload, by=by, new_transaction=new_transaction
+                )
+                if updated is None:
+                    raise query.QueryError(
+                        f"save(): no row on '{table}' with id {data['id']!r} — an explicit id "
+                        f"always means update; to insert, omit the id (or use match_on)."
+                    )
+                return updated
+
+            if match_on:
+                filters = {f: data[f] for f in match_on}
+                if self._match_on_is_constraint_backed(table, match_on):
+                    return await self._resolve_match_on(
+                        table, data, match_on, filters, by=by, new_transaction=new_transaction
+                    )
+                # str() every value so the same logical key always locks the
+                # same name regardless of how the caller spelled it (UUID vs
+                # str, ...).
+                lock_key = (
+                    f"relay:save:{table}:{sorted((k, str(v)) for k, v in filters.items())}"
+                )
+                async with self.lock(lock_key):
+                    return await self._resolve_match_on(
+                        table, data, match_on, filters, by=by, new_transaction=new_transaction
+                    )
+
             payload = {k: v for k, v in data.items() if k != "id"}
-            updated = await self._update(
-                table, data["id"], payload, by=by, new_transaction=new_transaction
-            )
-            if updated is None:
-                raise query.QueryError(
-                    f"save(): no row on '{table}' with id {data['id']!r} — an explicit id "
-                    f"always means update; to insert, omit the id (or use match_on)."
-                )
-            return updated
-
-        if match_on:
-            filters = {f: data[f] for f in match_on}
-            if self._match_on_is_constraint_backed(table, match_on):
-                return await self._resolve_match_on(
-                    table, data, match_on, filters, by=by, new_transaction=new_transaction
-                )
-            # str() every value so the same logical key always locks the same
-            # name regardless of how the caller spelled it (UUID vs str, ...).
-            lock_key = f"relay:save:{table}:{sorted((k, str(v)) for k, v in filters.items())}"
-            async with self.lock(lock_key):
-                return await self._resolve_match_on(
-                    table, data, match_on, filters, by=by, new_transaction=new_transaction
-                )
-
-        payload = {k: v for k, v in data.items() if k != "id"}
-        return await self._insert(table, payload, by=by, new_transaction=new_transaction)
+            return await self._insert(table, payload, by=by, new_transaction=new_transaction)
+        finally:
+            _skip_hook_events.reset(token)
 
     async def delete(
-        self, table: str, id: UUID, *, by: str | None = None, new_transaction: bool = False
+        self,
+        table: str,
+        id: UUID,
+        *,
+        by: str | None = None,
+        new_transaction: bool = False,
+        skip_hooks: bool = False,
+        skip_before_delete: bool = False,
+        skip_after_delete: bool = False,
+        skip_after_commit: bool = False,
+        skip_on_rollback: bool = False,
     ) -> None:
-        self._psqldb.schema(table)
-        ctx = HookContext(table=table)
-        dry_run = _dry_run.get()
-        async with self._postcommit_scope(
-            new_transaction=new_transaction, dry_run=dry_run
-        ) as deferred:
-            async with self._write_transaction(new_transaction=new_transaction) as conn:
-                try:
-                    async with self._transaction_or_dry_run(conn, dry_run):
-                        ctx.conn = conn
-                        if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
-                            # psqldb.get() already returns a plain dict (or None)
-                            ctx.old = await self._psqldb.get(table, id, conn=conn)
-                        ctx.doc = _delete_doc(ctx.old)
-                        await self._run_hooks(table, "before_delete", ctx)
-                        await self._psqldb.soft_delete(table, id, deleted_by=by, conn=conn)
-                        await self._run_hooks(table, "after_delete", ctx)
-                except Exception as exc:
+        """skip_hooks/skip_<event> — see save()'s own docstring for the
+        full reasoning; same scoped-to-this-call, opt-in-only semantics,
+        just against this method's own before_delete/after_delete/
+        after_commit/on_rollback events (delete() never fires validate/
+        before_save/after_save at all, so there's no skip flag for them
+        here)."""
+        skip = _resolve_skip_events(
+            skip_hooks,
+            before_delete=skip_before_delete,
+            after_delete=skip_after_delete,
+            after_commit=skip_after_commit,
+            on_rollback=skip_on_rollback,
+        )
+        token = _skip_hook_events.set(skip)
+        try:
+            self._psqldb.schema(table)
+            ctx = HookContext(table=table)
+            dry_run = _dry_run.get()
+            async with self._postcommit_scope(
+                new_transaction=new_transaction, dry_run=dry_run
+            ) as deferred:
+                async with self._write_transaction(new_transaction=new_transaction) as conn:
+                    try:
+                        async with self._transaction_or_dry_run(conn, dry_run):
+                            ctx.conn = conn
+                            if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
+                                # psqldb.get() already returns a plain dict (or None)
+                                ctx.old = await self._psqldb.get(table, id, conn=conn)
+                            ctx.doc = _delete_doc(ctx.old)
+                            await self._run_hooks(table, "before_delete", ctx)
+                            await self._psqldb.soft_delete(table, id, deleted_by=by, conn=conn)
+                            await self._run_hooks(table, "after_delete", ctx)
+                    except Exception as exc:
+                        ctx.conn = None
+                        ctx.error = exc
+                        deferred.append((table, ctx, False))
+                        raise
                     ctx.conn = None
-                    ctx.error = exc
-                    deferred.append((table, ctx, False))
-                    raise
-                ctx.conn = None
-            deferred.append((table, ctx, True))
+                deferred.append((table, ctx, True))
+        finally:
+            _skip_hook_events.reset(token)
 
     def all_columns(self, table: str) -> list[str]:
         """Every real column's name on `table` — for the internal, never-
@@ -1788,6 +1883,12 @@ class RelayProvider:
         by: str | None = None,
         limit: int | None = None,
         new_transaction: bool = False,
+        skip_hooks: bool = False,
+        skip_validate: bool = False,
+        skip_before_save: bool = False,
+        skip_after_save: bool = False,
+        skip_after_commit: bool = False,
+        skip_on_rollback: bool = False,
     ) -> list[dict]:
         """Bulk insert-or-update, one shared transaction for the whole
         batch. Per row: `id` present -> update that row directly. No id,
@@ -1805,159 +1906,209 @@ class RelayProvider:
         transaction, not a guarantee against a CONCURRENT save()/save_many()
         call racing the exact same match_on values. Add that locking here
         too if it ever becomes a real scenario, not before.
+
+        skip_hooks/skip_validate/skip_before_save/skip_after_save/
+        skip_after_commit/skip_on_rollback — see save()'s own docstring
+        for the full reasoning; applies uniformly across the WHOLE batch
+        (one skip decision per call, not per row) — exactly what a bulk
+        import wants.
         """
-        self._psqldb.schema(table)
-        if not rows:
-            return []
-        insert_ctxs: list[HookContext] = []
-        update_ctxs: list[HookContext] = []
-        dry_run = _dry_run.get()
-        async with self._postcommit_scope(
-            new_transaction=new_transaction, dry_run=dry_run
-        ) as deferred:
-            async with self._write_transaction(new_transaction=new_transaction) as conn:
-                try:
-                    async with self._transaction_or_dry_run(conn, dry_run):
-                        resolved: list[tuple[str, UUID | None, dict]] = []
-                        for row in rows:
-                            row_id = row.get("id")
-                            if row_id is not None:
-                                resolved.append(
-                                    ("update", row_id, {k: v for k, v in row.items() if k != "id"})
-                                )
-                                continue
-                            if match_on:
-                                filters = {f: row[f] for f in match_on}
-                                cap = (limit + 1) if limit is not None else None
-                                matches = await self._select(
-                                    table,
-                                    filters=filters,
-                                    fields=["id"],
-                                    order_by=None,
-                                    limit=cap,
-                                    offset=0,
-                                    distinct=False,
-                                )
-                                if limit is not None and len(matches) > limit:
-                                    raise query.QueryError(
-                                        f"save_many(): match_on {filters} matched more than "
-                                        f"limit={limit} row(s) on '{table}'."
+        skip = _resolve_skip_events(
+            skip_hooks,
+            validate=skip_validate,
+            before_save=skip_before_save,
+            after_save=skip_after_save,
+            after_commit=skip_after_commit,
+            on_rollback=skip_on_rollback,
+        )
+        token = _skip_hook_events.set(skip)
+        try:
+            self._psqldb.schema(table)
+            if not rows:
+                return []
+            insert_ctxs: list[HookContext] = []
+            update_ctxs: list[HookContext] = []
+            dry_run = _dry_run.get()
+            async with self._postcommit_scope(
+                new_transaction=new_transaction, dry_run=dry_run
+            ) as deferred:
+                async with self._write_transaction(new_transaction=new_transaction) as conn:
+                    try:
+                        async with self._transaction_or_dry_run(conn, dry_run):
+                            resolved: list[tuple[str, UUID | None, dict]] = []
+                            for row in rows:
+                                row_id = row.get("id")
+                                if row_id is not None:
+                                    resolved.append(
+                                        (
+                                            "update",
+                                            row_id,
+                                            {k: v for k, v in row.items() if k != "id"},
+                                        )
                                     )
-                                if matches:
-                                    data = {k: v for k, v in row.items() if k not in match_on}
-                                    for m in matches:
-                                        resolved.append(("update", m["id"], data))
                                     continue
-                            resolved.append(
-                                ("insert", None, {k: v for k, v in row.items() if k != "id"})
-                            )
+                                if match_on:
+                                    filters = {f: row[f] for f in match_on}
+                                    cap = (limit + 1) if limit is not None else None
+                                    matches = await self._select(
+                                        table,
+                                        filters=filters,
+                                        fields=["id"],
+                                        order_by=None,
+                                        limit=cap,
+                                        offset=0,
+                                        distinct=False,
+                                    )
+                                    if limit is not None and len(matches) > limit:
+                                        raise query.QueryError(
+                                            f"save_many(): match_on {filters} matched more than "
+                                            f"limit={limit} row(s) on '{table}'."
+                                        )
+                                    if matches:
+                                        data = {k: v for k, v in row.items() if k not in match_on}
+                                        for m in matches:
+                                            resolved.append(("update", m["id"], data))
+                                        continue
+                                resolved.append(
+                                    ("insert", None, {k: v for k, v in row.items() if k != "id"})
+                                )
 
-                        for kind, _rid, data in resolved:
-                            if kind == "insert":
-                                ctx = HookContext(table=table, old=None, payload=dict(data))
-                                ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
-                                insert_ctxs.append(ctx)
-                        update_targets = [
-                            (rid, data) for kind, rid, data in resolved if kind == "update"
-                        ]
-                        for _rid, data in update_targets:
-                            update_ctxs.append(HookContext(table=table, payload=dict(data)))
+                            for kind, _rid, data in resolved:
+                                if kind == "insert":
+                                    ctx = HookContext(table=table, old=None, payload=dict(data))
+                                    ctx.doc = _precommit_doc(None, ctx.payload, is_new=True)
+                                    insert_ctxs.append(ctx)
+                            update_targets = [
+                                (rid, data) for kind, rid, data in resolved if kind == "update"
+                            ]
+                            for _rid, data in update_targets:
+                                update_ctxs.append(HookContext(table=table, payload=dict(data)))
 
-                        need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
-                        if need_old and update_targets:
-                            old_rows = await self._psqldb.get_many(
-                                table, [rid for rid, _ in update_targets], conn=conn
-                            )
-                            # psqldb.get_many() already returns plain dicts
-                            old_by_id = {r["id"]: r for r in old_rows}
-                            for ctx, (rid, _data) in zip(update_ctxs, update_targets):
-                                ctx.old = old_by_id.get(rid)
-                        for ctx in update_ctxs:
-                            ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
+                            need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
+                            if need_old and update_targets:
+                                old_rows = await self._psqldb.get_many(
+                                    table, [rid for rid, _ in update_targets], conn=conn
+                                )
+                                # psqldb.get_many() already returns plain dicts
+                                old_by_id = {r["id"]: r for r in old_rows}
+                                for ctx, (rid, _data) in zip(update_ctxs, update_targets):
+                                    ctx.old = old_by_id.get(rid)
+                            for ctx in update_ctxs:
+                                ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
 
-                        all_ctxs = [*insert_ctxs, *update_ctxs]
-                        for ctx in all_ctxs:
-                            ctx.conn = conn
-                            await self._run_hooks(table, "validate", ctx)
-                            await self._run_hooks(table, "before_save", ctx)
+                            all_ctxs = [*insert_ctxs, *update_ctxs]
+                            for ctx in all_ctxs:
+                                ctx.conn = conn
+                                await self._run_hooks(table, "validate", ctx)
+                                await self._run_hooks(table, "before_save", ctx)
 
-                        if insert_ctxs:
-                            results = await self._psqldb.insert_many(
-                                table, [c.payload for c in insert_ctxs], created_by=by, conn=conn
-                            )
-                            # psqldb.insert_many() already returns plain dicts
-                            for c, r in zip(insert_ctxs, results):
-                                c.new = r
-                                c.doc = _postwrite_doc(c.new, None, is_new=True)
-                        if update_ctxs:
-                            results = await self._psqldb.update_many(
-                                table,
-                                [
-                                    {"id": rid, "data": c.payload}
-                                    for (rid, _d), c in zip(update_targets, update_ctxs)
-                                ],
-                                updated_by=by,
-                                conn=conn,
-                            )
-                            # psqldb.update_many() already returns plain dicts
-                            results_by_id = {r["id"]: r for r in results}
-                            for (rid, _d), c in zip(update_targets, update_ctxs):
-                                c.new = results_by_id.get(rid)
-                                c.doc = _postwrite_doc(c.new, c.doc.old, is_new=False)
+                            if insert_ctxs:
+                                results = await self._psqldb.insert_many(
+                                    table,
+                                    [c.payload for c in insert_ctxs],
+                                    created_by=by,
+                                    conn=conn,
+                                )
+                                # psqldb.insert_many() already returns plain dicts
+                                for c, r in zip(insert_ctxs, results):
+                                    c.new = r
+                                    c.doc = _postwrite_doc(c.new, None, is_new=True)
+                            if update_ctxs:
+                                results = await self._psqldb.update_many(
+                                    table,
+                                    [
+                                        {"id": rid, "data": c.payload}
+                                        for (rid, _d), c in zip(update_targets, update_ctxs)
+                                    ],
+                                    updated_by=by,
+                                    conn=conn,
+                                )
+                                # psqldb.update_many() already returns plain dicts
+                                results_by_id = {r["id"]: r for r in results}
+                                for (rid, _d), c in zip(update_targets, update_ctxs):
+                                    c.new = results_by_id.get(rid)
+                                    c.doc = _postwrite_doc(c.new, c.doc.old, is_new=False)
 
-                        for ctx in all_ctxs:
-                            await self._run_hooks(table, "after_save", ctx)
-                except Exception as exc:
+                            for ctx in all_ctxs:
+                                await self._run_hooks(table, "after_save", ctx)
+                    except Exception as exc:
+                        for ctx in [*insert_ctxs, *update_ctxs]:
+                            ctx.conn = None
+                            ctx.error = exc
+                            deferred.append((table, ctx, False))
+                        raise
                     for ctx in [*insert_ctxs, *update_ctxs]:
                         ctx.conn = None
-                        ctx.error = exc
-                        deferred.append((table, ctx, False))
-                    raise
                 for ctx in [*insert_ctxs, *update_ctxs]:
-                    ctx.conn = None
-            for ctx in [*insert_ctxs, *update_ctxs]:
-                deferred.append((table, ctx, True))
-        return [ctx.new for ctx in [*insert_ctxs, *update_ctxs]]
+                    deferred.append((table, ctx, True))
+            return [ctx.new for ctx in [*insert_ctxs, *update_ctxs]]
+        finally:
+            _skip_hook_events.reset(token)
 
     async def delete_many(
-        self, table: str, ids: list[UUID], *, by: str | None = None, new_transaction: bool = False
+        self,
+        table: str,
+        ids: list[UUID],
+        *,
+        by: str | None = None,
+        new_transaction: bool = False,
+        skip_hooks: bool = False,
+        skip_before_delete: bool = False,
+        skip_after_delete: bool = False,
+        skip_after_commit: bool = False,
+        skip_on_rollback: bool = False,
     ) -> None:
-        self._psqldb.schema(table)
-        if not ids:
-            return
-        need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
-        ctxs = [HookContext(table=table) for _ in ids]
-        dry_run = _dry_run.get()
-        async with self._postcommit_scope(
-            new_transaction=new_transaction, dry_run=dry_run
-        ) as deferred:
-            async with self._write_transaction(new_transaction=new_transaction) as conn:
-                try:
-                    async with self._transaction_or_dry_run(conn, dry_run):
-                        if need_old:
-                            old_rows = await self._psqldb.get_many(table, ids, conn=conn)
-                            # psqldb.get_many() already returns plain dicts
-                            old_by_id = {r["id"]: r for r in old_rows}
-                            for ctx, row_id in zip(ctxs, ids):
-                                ctx.old = old_by_id.get(row_id)
+        """skip_hooks/skip_<event> — see save()'s own docstring; applies
+        uniformly across the whole batch, same as save_many()."""
+        skip = _resolve_skip_events(
+            skip_hooks,
+            before_delete=skip_before_delete,
+            after_delete=skip_after_delete,
+            after_commit=skip_after_commit,
+            on_rollback=skip_on_rollback,
+        )
+        token = _skip_hook_events.set(skip)
+        try:
+            self._psqldb.schema(table)
+            if not ids:
+                return
+            need_old = self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS)
+            ctxs = [HookContext(table=table) for _ in ids]
+            dry_run = _dry_run.get()
+            async with self._postcommit_scope(
+                new_transaction=new_transaction, dry_run=dry_run
+            ) as deferred:
+                async with self._write_transaction(new_transaction=new_transaction) as conn:
+                    try:
+                        async with self._transaction_or_dry_run(conn, dry_run):
+                            if need_old:
+                                old_rows = await self._psqldb.get_many(table, ids, conn=conn)
+                                # psqldb.get_many() already returns plain dicts
+                                old_by_id = {r["id"]: r for r in old_rows}
+                                for ctx, row_id in zip(ctxs, ids):
+                                    ctx.old = old_by_id.get(row_id)
+                            for ctx in ctxs:
+                                ctx.doc = _delete_doc(ctx.old)
+                            for ctx in ctxs:
+                                ctx.conn = conn
+                                await self._run_hooks(table, "before_delete", ctx)
+                            await self._psqldb.soft_delete_many(
+                                table, ids, deleted_by=by, conn=conn
+                            )
+                            for ctx in ctxs:
+                                await self._run_hooks(table, "after_delete", ctx)
+                    except Exception as exc:
                         for ctx in ctxs:
-                            ctx.doc = _delete_doc(ctx.old)
-                        for ctx in ctxs:
-                            ctx.conn = conn
-                            await self._run_hooks(table, "before_delete", ctx)
-                        await self._psqldb.soft_delete_many(table, ids, deleted_by=by, conn=conn)
-                        for ctx in ctxs:
-                            await self._run_hooks(table, "after_delete", ctx)
-                except Exception as exc:
+                            ctx.conn = None
+                            ctx.error = exc
+                            deferred.append((table, ctx, False))
+                        raise
                     for ctx in ctxs:
                         ctx.conn = None
-                        ctx.error = exc
-                        deferred.append((table, ctx, False))
-                    raise
                 for ctx in ctxs:
-                    ctx.conn = None
-            for ctx in ctxs:
-                deferred.append((table, ctx, True))
+                    deferred.append((table, ctx, True))
+        finally:
+            _skip_hook_events.reset(token)
 
     # ------------------------------------------------------------------ #
     # Whitelisting — plugins/<plugin>/api/*.py, same controlled-loading
