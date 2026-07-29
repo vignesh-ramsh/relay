@@ -7,17 +7,19 @@
     {"id": "AA03", "name": "executor", "type": "SELECT", "required": true, "options": ["relay", "lineup"]},
     {"id": "AA04", "name": "job_type", "type": "SELECT", "required": true, "options": ["Scheduler", "Task"]},
     {"id": "AA05", "name": "queued_by", "type": "STRING", "length": 100},
-    {"id": "AA06", "name": "status", "type": "SELECT", "required": true, "options": ["success", "failed"]},
+    {"id": "AA06", "name": "status", "type": "SELECT", "required": true, "options": ["Queued", "Running", "success", "failed"]},
     {"id": "AA07", "name": "error", "type": "TEXT"},
-    {"id": "AA08", "name": "started_at", "type": "DATETIME", "required": true},
-    {"id": "AA09", "name": "finished_at", "type": "DATETIME", "required": true},
-    {"id": "AA10", "name": "duration_ms", "type": "INT", "required": true},
+    {"id": "AA08", "name": "started_at", "type": "DATETIME"},
+    {"id": "AA09", "name": "finished_at", "type": "DATETIME"},
+    {"id": "AA10", "name": "duration_ms", "type": "INT"},
     {"id": "AA11", "name": "request_id", "type": "STRING", "length": 128},
-    {"id": "AA12", "name": "triggered_by", "type": "STRING", "length": 255}
+    {"id": "AA12", "name": "triggered_by", "type": "STRING", "length": 255},
+    {"id": "AA13", "name": "task_id", "type": "STRING", "length": 64}
   ],
   "index": [
     {"key": "idx_job_log_finished_at", "fields": ["finished_at"]},
     {"key": "idx_job_log_task_name", "fields": ["task_name"]},
-    {"key": "idx_job_log_request_id", "fields": ["request_id"]}
+    {"key": "idx_job_log_request_id", "fields": ["request_id"]},
+    {"key": "idx_job_log_task_id", "fields": ["task_id"]}
   ]
 }
