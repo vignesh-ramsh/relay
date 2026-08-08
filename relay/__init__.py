@@ -302,12 +302,30 @@ class RelayError(Exception):
     internal failure. Carries enough to become an HTTP response later
     (whitelisting increment) but works identically with no Gateway involved:
     from a hook, the CLI, or a queued task it's just a normal exception to
-    whatever called in."""
+    whatever called in.
 
-    def __init__(self, message: str, *, status: int = 400, code: str | None = None) -> None:
+    `extra` — additive, JSON-serializable fields merged into the HTTP error
+    body alongside error/code (never overwriting either, even if a caller's
+    dict happens to use those keys). For an error that's really a guided
+    NEXT STEP rather than a dead end — e.g. login's max_sessions_reached
+    handing back the caller's own active session list so a client can offer
+    "log out an existing one and retry" — without it every such case would
+    need its own bespoke non-2xx response shape, undiscoverable by the
+    generic {error, code} handling every other whitelisted-function caller
+    already relies on."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int = 400,
+        code: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
         self.message = message
         self.status = status
         self.code = code
+        self.extra = extra
         super().__init__(message)
 
 
@@ -472,6 +490,13 @@ class WhitelistedFunction:
     arc_session cookie itself to know which specific session to revoke
     (identity alone only says WHO, not which of that user's sessions this
     particular request's cookie belongs to).
+    wants_headers: the same mechanism again, for a function that declares a
+    `headers` parameter (lowercase names, gateway.request.Request.headers'
+    own shape) — e.g. authn.login() capturing User-Agent for its own
+    _sessions row. Unlike wants_request, this does NOT skip normal JSON
+    body parsing (see wants_request's own docstring below for why that one
+    does) — a function can want BOTH the parsed body kwargs it always had
+    AND the raw headers, which is exactly login()'s case.
     wants_request: the same mechanism again, for a function that declares a
     `request` parameter — the raw gateway.request.Request, for the rare
     handler that genuinely needs something no JSON-kwarg shape can carry
@@ -490,6 +515,7 @@ class WhitelistedFunction:
     wants_identity: bool = False
     wants_client_ip: bool = False
     wants_cookies: bool = False
+    wants_headers: bool = False
     wants_request: bool = False
     wants_request_id: bool = False  # same mechanism again, for a function that
     # declares a `request_id` parameter — Gateway's own
@@ -2296,6 +2322,7 @@ class RelayProvider:
                 wants_identity="identity" in sig.parameters,
                 wants_client_ip="client_ip" in sig.parameters,
                 wants_cookies="cookies" in sig.parameters,
+                wants_headers="headers" in sig.parameters,
                 wants_request="request" in sig.parameters,
                 wants_request_id="request_id" in sig.parameters,
                 wants_dry_run="dry_run" in sig.parameters,
@@ -2533,6 +2560,8 @@ class RelayProvider:
                 kwargs["client_ip"] = getattr(request, "client_ip", None)
             if wf.wants_cookies:
                 kwargs["cookies"] = getattr(request, "cookies", {})
+            if wf.wants_headers:
+                kwargs["headers"] = getattr(request, "headers", {})
             if wf.wants_request:
                 kwargs["request"] = request
             if wf.wants_request_id:
@@ -2593,7 +2622,8 @@ class RelayProvider:
             try:
                 result = await wf.fn(**kwargs)
             except RelayError as exc:
-                raise HTTPError(exc.status, {"error": exc.message, "code": exc.code}) from exc
+                body = {**(exc.extra or {}), "error": exc.message, "code": exc.code}
+                raise HTTPError(exc.status, body) from exc
             finally:
                 _dry_run.reset(token)
                 _call_context.reset(ctx_token)
@@ -2939,8 +2969,15 @@ class RelayProvider:
     # + rotating JSON file handlers for free instead of a second, separate
     # rich.Console output nothing else in the system shared.
     # ------------------------------------------------------------------ #
-    def throw(self, message: str, *, status: int = 400, code: str | None = None) -> None:
-        raise RelayError(message, status=status, code=code)
+    def throw(
+        self,
+        message: str,
+        *,
+        status: int = 400,
+        code: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        raise RelayError(message, status=status, code=code, extra=extra)
 
     def log(self, message: str, *, level: str = "info", **context: Any) -> None:
         _logger.log(
