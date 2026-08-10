@@ -3055,7 +3055,7 @@ def register(kernel: Any) -> None:
     # processes, for everything IT runs. relay owns the schema since it's
     # the common denominator: every project using lineup also has relay,
     # not the reverse.
-    kernel.get("psqldb").register_model(Path(__file__).parent / "schemas")
+    kernel.get("psqldb").register_model(Path(__file__).parent.parent / "schemas")
 
     kernel.export(
         CAPABILITY,
