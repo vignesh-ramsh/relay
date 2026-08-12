@@ -1962,6 +1962,7 @@ class RelayProvider:
                     try:
                         async with self._transaction_or_dry_run(conn, dry_run):
                             resolved: list[tuple[str, UUID | None, dict]] = []
+                            pending_match: list[dict] = []
                             for row in rows:
                                 row_id = row.get("id")
                                 if row_id is not None:
@@ -1972,19 +1973,85 @@ class RelayProvider:
                                             {k: v for k, v in row.items() if k != "id"},
                                         )
                                     )
-                                    continue
-                                if match_on:
-                                    filters = {f: row[f] for f in match_on}
-                                    cap = (limit + 1) if limit is not None else None
-                                    matches = await self._select(
-                                        table,
-                                        filters=filters,
-                                        fields=["id"],
-                                        order_by=None,
-                                        limit=cap,
-                                        offset=0,
-                                        distinct=False,
+                                elif match_on:
+                                    pending_match.append(row)
+                                else:
+                                    resolved.append(
+                                        ("insert", None, {k: v for k, v in row.items() if k != "id"})
                                     )
+
+                            if pending_match:
+                                # Resolves every match_on-based row's lookup
+                                # in as few round trips as possible instead
+                                # of one _select() per ROW — the exact N+1
+                                # pattern that made a 100-row save_many()
+                                # ~24x slower than an equivalent insert-only
+                                # batch, and ~1s for 500 rows, benchmarked
+                                # against a 20k-row table. Distinct VALUE
+                                # combos first (a real bulk batch commonly
+                                # repeats the same combo across many rows,
+                                # e.g. the same `status`), so even the
+                                # per-combo fallback below is already fewer
+                                # queries than one per row whenever they do.
+                                distinct_filters: dict[tuple, dict] = {}
+                                for row in pending_match:
+                                    key = tuple(row[f] for f in match_on)
+                                    distinct_filters.setdefault(key, {f: row[f] for f in match_on})
+                                read_fields = list(dict.fromkeys([*match_on, "id"]))
+                                matches_by_key: dict[tuple, list[dict]] = {}
+
+                                if limit is None:
+                                    # No per-row cap to enforce -> every
+                                    # distinct combo can be OR'd together
+                                    # (query.py's own any_of) and resolved
+                                    # query.MAX_ANY_OF_BRANCHES combos at a
+                                    # time, unbounded — matches the existing
+                                    # "no limit given -> no implicit cap"
+                                    # contract exactly, just batched.
+                                    items = list(distinct_filters.items())
+                                    for i in range(0, len(items), query.MAX_ANY_OF_BRANCHES):
+                                        group = items[i : i + query.MAX_ANY_OF_BRANCHES]
+                                        found = await self._select(
+                                            table,
+                                            filters={query.ANY_OF_KEY: [f for _key, f in group]},
+                                            fields=read_fields,
+                                            order_by=None,
+                                            limit=None,
+                                            offset=0,
+                                            distinct=False,
+                                        )
+                                        for r in found:
+                                            matches_by_key.setdefault(
+                                                tuple(r[f] for f in match_on), []
+                                            ).append(r)
+                                else:
+                                    # A real per-row bound WAS requested. A
+                                    # single SQL LIMIT can't be split fairly
+                                    # across several OR'd combos in one
+                                    # query — it caps the COMBINED result
+                                    # set, silently starving whichever
+                                    # combo's rows Postgres happens to
+                                    # return last, not each combo's own
+                                    # count — so this stays one query per
+                                    # DISTINCT combo (not per row) instead:
+                                    # correct, and still a real win over the
+                                    # old per-row loop whenever combos repeat.
+                                    cap = limit + 1
+                                    for key, filters in distinct_filters.items():
+                                        matches_by_key[key] = await self._select(
+                                            table,
+                                            filters=filters,
+                                            fields=read_fields,
+                                            order_by=None,
+                                            limit=cap,
+                                            offset=0,
+                                            distinct=False,
+                                        )
+
+                                for row in pending_match:
+                                    key = tuple(row[f] for f in match_on)
+                                    filters = {f: row[f] for f in match_on}
+                                    matches = matches_by_key.get(key, [])
                                     if limit is not None and len(matches) > limit:
                                         raise query.QueryError(
                                             f"save_many(): match_on {filters} matched more than "
@@ -1994,10 +2061,14 @@ class RelayProvider:
                                         data = {k: v for k, v in row.items() if k not in match_on}
                                         for m in matches:
                                             resolved.append(("update", m["id"], data))
-                                        continue
-                                resolved.append(
-                                    ("insert", None, {k: v for k, v in row.items() if k != "id"})
-                                )
+                                    else:
+                                        resolved.append(
+                                            (
+                                                "insert",
+                                                None,
+                                                {k: v for k, v in row.items() if k != "id"},
+                                            )
+                                        )
 
                             for kind, _rid, data in resolved:
                                 if kind == "insert":
