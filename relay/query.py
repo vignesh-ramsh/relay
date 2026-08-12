@@ -223,12 +223,26 @@ def render_where(
     `any_of_branches` is passed as None (not just []) when recursing to
     render one branch's own clause below — a branch can never itself
     contain another any_of (parse_filters already rejects that), so there
-    is no infinite recursion here, just one guaranteed-flat level."""
+    is no infinite recursion here, just one guaranteed-flat level.
+
+    Every column reference is qualified with `table` — filters only ever
+    name a plain column on the base table itself (never a resolve()d
+    subfield, module docstring's "Scope" section), so this is never
+    WRONG, but it IS required once a caller's `fields` also uses
+    arc.relay.resolve(...): that introduces a LEFT JOIN, and an
+    unqualified column name that happens to also exist on the joined
+    table (id, on literally every table, but potentially any other name
+    too) becomes ambiguous SQL — Postgres has no way to know which side's
+    column a bare "id" means once there are two tables in scope. Found
+    live: arc.relay.get(table, id, fields=[..., resolve(...)]) — get()
+    always filters by "id" internally — raised AmbiguousColumnError
+    unconditionally, on every single call, the moment resolve() was used
+    at all."""
     clauses: list[str] = []
     params: list[Any] = []
     i = start
     for field, op, value in parsed:
-        col = f'"{field.name}"'
+        col = f'"{table}"."{field.name}"'
         if op in _COMPARISON_OPS:
             clauses.append(f"{col} {_COMPARISON_OPS[op]} ${i}")
             params.append(value)
@@ -270,6 +284,10 @@ def render_where(
 
 
 def render_order_by(table: str, schema: TableSchema, order_by: list[str]) -> str:
+    """Same table-qualification reasoning as render_where's own docstring
+    — order_by only ever names a plain column on the base table, but once
+    resolve() has introduced a LEFT JOIN, an unqualified name shared with
+    the joined table (id, again, on every table) is ambiguous SQL."""
     if len(order_by) > MAX_ORDER_FIELDS:
         raise QueryError(
             f"order_by supports at most {MAX_ORDER_FIELDS} fields, got {len(order_by)}."
@@ -283,7 +301,7 @@ def render_order_by(table: str, schema: TableSchema, order_by: list[str]) -> str
             raise QueryError(
                 f"unknown column '{name}' in order_by on table '{table}' (known: {sorted(columns)})."
             )
-        parts.append(f'"{name}" {"DESC" if desc else "ASC"}')
+        parts.append(f'"{table}"."{name}" {"DESC" if desc else "ASC"}')
     return ", ".join(parts)
 
 
