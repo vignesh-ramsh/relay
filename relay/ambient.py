@@ -86,6 +86,27 @@ _postcommit_queue: ContextVar[list | None] = ContextVar(
     "arc_relay_postcommit_queue", default=None
 )
 
+# A durable enqueue() call made from INSIDE an active write (a hook calling
+# arc.relay.enqueue()) must not actually record or dispatch the job until
+# the OUTERMOST write's real fate — committed or rolled back — is known;
+# writing a Queued _job_log row for work whose data never persisted would
+# be exactly the "job ran, but the thing it was about doesn't exist" bug
+# this exists to prevent (docs/"Missing Failure-Mode Audits", item 19).
+#
+# Same shape as _postcommit_queue: only the outermost write creates the
+# list (in _postcommit_scope), a nested enqueue() appends its own
+# asyncio.Future to whatever list it finds (contextvars propagate the
+# SAME outermost list down through nested awaits), and _postcommit_scope
+# resolves every future with the final committed/not-committed bool the
+# instant the outermost write's transaction block exits — before hook
+# flushing, so a durable job's dispatch and a table's after_commit hooks
+# become eligible to run at essentially the same moment, not one blocking
+# the other. None (the default) means "no active write" — enqueue() reads
+# that as "dispatch immediately," its original, unchanged behavior.
+_postcommit_waiters: ContextVar[list | None] = ContextVar(
+    "arc_relay_postcommit_waiters", default=None
+)
+
 # The on-the-wire label names a CallContext travels under when a job has to
 # cross a PROCESS boundary (see context_labels()/use_context_labels()). The
 # `arc_ctx_` prefix keeps them unambiguously ours: a TaskIQ message also

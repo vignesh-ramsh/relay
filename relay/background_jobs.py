@@ -27,14 +27,86 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import arc
 
-from .ambient import _active_conn, _active_stream, _dry_run, _postcommit_queue
+from .ambient import _active_conn, _active_stream, _dry_run, _postcommit_queue, _postcommit_waiters
+
+# How long a claim on a _job_log row is honored before another poller (this
+# process's own reaper, or another process's) treats it as abandoned and
+# re-claims it. Deliberately generous relative to _REAP_INTERVAL_SECONDS —
+# a lease that expired only means "nobody has RENEWED it," which for a
+# fire-and-forget job that hasn't been made to heartbeat is indistinguishable
+# from "still running, just slow" until it's well past due; the cost of
+# guessing wrong here is a job re-run early (a duplicate-execution risk the
+# caller already accepts by using a background job at all — no different
+# from lineup's own at-most-once-per-attempt, best-effort semantics), not
+# data loss, so this leans toward "wait it out" rather than "reclaim eagerly."
+_JOB_LEASE_SECONDS = 60
+# How often RelayProvider's own poller (started in open(), see relay/
+# __init__.py) checks for abandoned rows. Independent of lineup entirely —
+# this exists so `arc.relay.enqueue()`'s in-process fallback survives a
+# crash even in a project that never installs lineup at all (docs/"Missing
+# Failure-Mode Audits", items 15/19 — see this method's own docstring below
+# for the reasoning).
+_REAP_INTERVAL_SECONDS = 15
+
+
+def _durable_job_reference(fn: Any) -> tuple[str, str] | None:
+    """(module_path, qualname) if `fn` can be reconstructed and re-called
+    by a DIFFERENT process/task later — the same resolvability contract
+    `lineup.check_resolvable()` enforces, duplicated here in small,
+    deliberately, rather than imported: relay optionally depends on
+    lineup, never the reverse (module docstring above), so relay cannot
+    reach into lineup's implementation even for a helper this similar.
+
+    Returns None instead of raising on anything unresolvable (a lambda, a
+    closure, a reassigned name) — unlike lineup's version, this is not a
+    hard requirement a caller opted into by installing lineup; it is an
+    optional upgrade enqueue() below tries to give every caller for free.
+    A caller whose fn doesn't qualify simply keeps today's exact behavior,
+    unchanged and with no error — see enqueue()'s own docstring."""
+    name = getattr(fn, "__name__", None)
+    qualname = getattr(fn, "__qualname__", None)
+    module_path = getattr(fn, "__module__", None)
+    if name == "<lambda>" or not qualname or not module_path or "<locals>" in qualname:
+        return None
+    module = sys.modules.get(module_path)
+    if module is None:
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            return None
+    resolved: Any = module
+    try:
+        for part in qualname.split("."):
+            resolved = getattr(resolved, part)
+    except AttributeError:
+        return None
+    if resolved is not fn:
+        return None
+    return module_path, qualname
+
+
+def _json_safe(value: Any) -> bool:
+    """Whether `value` survives a JSONB round trip unchanged in kind — the
+    other half of durable eligibility alongside _durable_job_reference().
+    A durable job's args/kwargs have to be reconstructable from a Postgres
+    row by a process that never saw the original Python objects (including
+    this SAME process, after a crash and restart) — a live object, a
+    closure-captured connection, or anything else json.dumps can't handle
+    can only ever have worked by being passed directly in memory, which is
+    exactly what the non-durable fallback still does, unchanged."""
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 class BackgroundJobsMixin:
@@ -43,11 +115,32 @@ class BackgroundJobsMixin:
     _kernel: Any
     _background_tasks: set[asyncio.Task]
     _loading_plugin: str | None
+    _worker_id: str
+    _reap_task: asyncio.Task | None
 
     def _track_task(self, task: asyncio.Task) -> asyncio.Task:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    # ------------------------------------------------------------------ #
+    # Durable-queue lifecycle — RelayProvider.open()/close() (relay/
+    # __init__.py) start/stop this poller the same way psqldb/redix/lineup
+    # start their own connections, via Gateway's ASGI lifespan calling both
+    # automatically for any capability that has them. A CLI-only process
+    # (not behind Gateway) never calls open(), so it never runs this loop —
+    # fine, since reaping is a "something alive has to be polling" concern,
+    # only meaningful for a long-running process in the first place.
+    # ------------------------------------------------------------------ #
+    async def _reap_loop(self) -> None:
+        while True:
+            await asyncio.sleep(_REAP_INTERVAL_SECONDS)
+            try:
+                await self._reap_stale_jobs()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad pass must not kill the loop
+                self.log(f"durable job reaper pass failed: {exc}", level="error")
 
     @staticmethod
     def _detach_request_scoped_state() -> None:
@@ -77,6 +170,13 @@ class BackgroundJobsMixin:
             A background job's own writes are their own outermost
             transaction and must flush their own hooks, not append to a
             queue nobody will ever flush.
+          * `_postcommit_waiters` — the enclosing write's list of durable-
+            enqueue futures (this file's own dispatch-deferral mechanism,
+            see enqueue()). Same reasoning as `_postcommit_queue`: a job's
+            own nested enqueue() call is its own outermost write and must
+            dispatch immediately, not register a future against an outer
+            scope that already resolved (or, worse, one that hasn't yet
+            and never will from in here).
           * `_active_stream` — publish() from a detached job would push
             into a response stream that has already been sent and closed.
 
@@ -88,6 +188,7 @@ class BackgroundJobsMixin:
         _active_conn.set(None)
         _dry_run.set(False)
         _postcommit_queue.set(None)
+        _postcommit_waiters.set(None)
         _active_stream.set(None)
 
     def register_tasks(self, tasks_dir: str | Path) -> None:
@@ -194,7 +295,31 @@ class BackgroundJobsMixin:
         TaskIQ message it kicks, and the worker rebinds them via
         `use_context_labels()` around the job before running it. Either
         way the `_job_log` row records `request_id`/`triggered_by`, so the
-        trail survives even after the process that queued the job is gone."""
+        trail survives even after the process that queued the job is gone.
+
+        DISPATCH TIMING when called from inside an active write (a hook):
+        none of the three paths above actually dispatch until the OUTERMOST
+        write's real fate is known — committed or rolled back. Building the
+        Redis message / durable row eagerly, before that, used to mean a
+        rolled-back write could still leave a job queued for data that was
+        never persisted (docs/"Missing Failure-Mode Audits", item 19). The
+        returned Task always exists immediately (so `_track_task` still
+        holds a strong reference from the moment this call returns), but
+        its body waits on a future the enclosing write resolves the instant
+        its transaction block exits — see ambient.py's _postcommit_waiters
+        and transactions.py's _postcommit_scope. Called with no active
+        write in progress (the overwhelmingly common case — an API handler,
+        a CLI, a background job itself), there is nothing to wait for and
+        dispatch starts immediately, exactly as before."""
+        waiters = _postcommit_waiters.get()
+
+        def _await_gate() -> "asyncio.Future | None":
+            if waiters is None:
+                return None
+            fut = asyncio.get_running_loop().create_future()
+            waiters.append(fut)
+            return fut
+
         if self._kernel.has("lineup"):
             lineup = self._kernel.get("lineup")
             if lineup.is_task(fn):
@@ -205,7 +330,19 @@ class BackgroundJobsMixin:
                 )  # raises TypeError here, synchronously, before any Task exists
                 coro = lineup.enqueue_by_path(fn, *args, queue=queue, **kwargs)
 
+            gate = _await_gate()
+
             async def _handoff() -> Any:
+                if gate is not None:
+                    committed = await gate
+                    if not committed:
+                        # `coro` (lineup.enqueue()/enqueue_by_path(), built
+                        # above but never run — a coroutine's body doesn't
+                        # execute until awaited) must be closed explicitly
+                        # here, or Python logs a "coroutine was never
+                        # awaited" warning once it's garbage-collected.
+                        coro.close()
+                        return None
                 # Only pushes a message to Redis — but it still must not
                 # run holding the enclosing write's DB connection, and a
                 # handoff during a GET must not be silently dry-run'd into
@@ -227,12 +364,54 @@ class BackgroundJobsMixin:
             task.add_done_callback(_on_enqueue_done)
             return task
 
-        started_at = datetime.now(timezone.utc)
         # Captured HERE, in the caller's own context, not inside the task —
         # _detach_request_scoped_state() deliberately leaves _call_context
         # alone, so reading it inside would work too, but capturing it at
         # the call site keeps the log row correct even if that ever changes.
         call_ctx = self.context()
+        durable_ref = _durable_job_reference(fn)
+        durable_eligible = (
+            durable_ref is not None and _json_safe(list(args)) and _json_safe(kwargs)
+        )
+
+        if durable_eligible:
+            module_path, qualname = durable_ref
+            payload = {
+                "module": module_path,
+                "qualname": qualname,
+                "args": list(args),
+                "kwargs": kwargs,
+            }
+            gate = _await_gate()
+
+            async def _run_durable() -> Any:
+                if gate is not None:
+                    committed = await gate
+                    if not committed:
+                        return None
+                self._detach_request_scoped_state()
+                return await self._dispatch_durable_fallback(
+                    fn, args, kwargs, payload=payload, queue=queue, call_ctx=call_ctx
+                )
+
+            task = self._track_task(asyncio.create_task(_run_durable()))
+
+            def _on_durable_done(t: asyncio.Task) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    self.log(f"enqueued task {fn.__name__} failed: {exc}", level="error")
+
+            task.add_done_callback(_on_durable_done)
+            return task
+
+        # Not durable-eligible (a lambda, a closure, or an argument that
+        # can't survive a JSONB round trip) — today's original in-process
+        # fallback, completely unchanged: lost on crash/restart, no retry,
+        # no persistence. `queue=` has no meaning here, there's no queue
+        # concept without a durable record or lineup.
+        started_at = datetime.now(timezone.utc)
 
         async def _run_and_log() -> Any:
             # FIRST statement in the task: drop the enclosing request's
@@ -290,3 +469,177 @@ class BackgroundJobsMixin:
 
         task.add_done_callback(_on_done)
         return task
+
+    # ------------------------------------------------------------------ #
+    # Durable dispatch for the no-lineup fallback — see enqueue()'s own
+    # docstring for the eligibility rule and the DISPATCH TIMING section.
+    # ------------------------------------------------------------------ #
+    async def _dispatch_durable_fallback(
+        self,
+        fn: Callable[..., Awaitable[Any]],
+        args: tuple,
+        kwargs: dict,
+        *,
+        payload: dict,
+        queue: str,
+        call_ctx: Any,
+    ) -> Any:
+        """Writes the Queued+payload row first — durable, reconstructable
+        by ANY process from the row alone, not just this one — then
+        immediately self-claims and runs it in THIS process, for the same
+        near-zero latency the plain fallback always had. If this process
+        dies before finishing, the row is left claimed with a lease that
+        expires; _reap_stale_jobs() (this process's own poller, or any
+        other process's, since claiming uses SKIP LOCKED) picks it back up
+        later — the crash-recovery half of what used to be a pure
+        fire-and-forget `asyncio.create_task()` with nothing behind it.
+
+        If the DB itself is unreachable right now, durability just isn't
+        available this instant — runs `fn` directly instead of losing the
+        job outright over a failed logging-table write, the same
+        "best-effort, must never mask the real outcome" posture the
+        original _run_and_log() finally-block already used for logging."""
+        queued_at = datetime.now(timezone.utc)
+        try:
+            # psqldb.insert() strips "id" as a system column and lets
+            # Postgres default-generate it — so the row's real id comes
+            # back from the INSERT's own RETURNING *, not from anything
+            # chosen up front.
+            inserted = await arc.psqldb.insert(
+                "_job_log",
+                {
+                    "task_name": f"{payload['module']}.{payload['qualname']}",
+                    "queue": queue,
+                    "executor": "relay",
+                    "job_type": "Task",
+                    "queued_by": payload["module"].split(".")[0] or None,
+                    "status": "Queued",
+                    "payload": payload,
+                    "queued_at": queued_at,
+                    "request_id": call_ctx.request_id,
+                    "triggered_by": call_ctx.user,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - a logging-table outage must not lose the job
+            self.log(
+                f"failed to write durable _job_log row for {fn.__name__}: {exc} — "
+                f"running in-process without a durable record instead",
+                level="error",
+            )
+            return await fn(*args, **kwargs)
+
+        claimed = await self._claim_job_log_row(inserted["id"])
+        if claimed is None:
+            # A reaper pass (this process's own, or another's) already
+            # claimed it in the narrow window since our own INSERT
+            # committed — nothing left to do, whoever claimed it runs it.
+            return None
+        return await self._run_claimed_job_log_row(claimed)
+
+    async def _claim_job_log_row(self, row_id: str) -> Any | None:
+        """Conditionally claims one specific row by id — used right after
+        this process's own INSERT, where it's virtually always uncontested.
+        `WHERE status='Queued'` makes a lost race a no-op, not a stolen
+        claim: if a reaper pass already got there first, this simply
+        updates zero rows and returns None."""
+        started_at = datetime.now(timezone.utc)
+        lease_until = started_at + timedelta(seconds=_JOB_LEASE_SECONDS)
+        async with arc.psqldb.acquire() as conn:
+            return await conn.fetchrow(
+                'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
+                'started_at=$4 WHERE id=$5 AND status=$6 RETURNING *',
+                "Running",
+                self._worker_id,
+                lease_until,
+                started_at,
+                row_id,
+                "Queued",
+            )
+
+    async def _run_claimed_job_log_row(self, row: Any) -> Any:
+        """Reconstructs and runs a job purely from an already-claimed
+        `_job_log` row's own payload — shared by the immediate self-claim
+        path above and _reap_stale_jobs() below, which is the entire point:
+        a row claimed by a poller on a DIFFERENT process, hours after the
+        process that enqueued it is gone, runs through the exact same code
+        path as the common case, with no special-casing for "this is a
+        recovery, not the first attempt." Re-raises on failure (after
+        recording it on the row) so a direct caller's own done-callback
+        still logs it — _reap_stale_jobs() catches around each call for
+        exactly that reason, so one bad job doesn't stop the reap pass."""
+        payload = row["payload"] or {}
+        module_path, qualname = payload.get("module"), payload.get("qualname")
+        args, kwargs = payload.get("args") or [], payload.get("kwargs") or {}
+        row_id = row["id"]
+        started_at = row["started_at"] or datetime.now(timezone.utc)
+        status, error = "success", None
+        try:
+            module = importlib.import_module(module_path)
+            target: Any = module
+            for part in qualname.split("."):
+                target = getattr(target, part)
+            return await target(*args, **kwargs)
+        except Exception as exc:
+            status, error = "failed", f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            finished_at = datetime.now(timezone.utc)
+            try:
+                async with arc.psqldb.acquire() as conn:
+                    await conn.execute(
+                        'UPDATE "_job_log" SET status=$1, error=$2, finished_at=$3, '
+                        "duration_ms=$4 WHERE id=$5",
+                        status,
+                        error,
+                        finished_at,
+                        int((finished_at - started_at).total_seconds() * 1000),
+                        row_id,
+                    )
+            except Exception as log_exc:  # noqa: BLE001 - must not mask the job's own outcome
+                self.log(f"failed to write finished _job_log row {row_id}: {log_exc}", level="error")
+
+    async def _reap_stale_jobs(self, limit: int = 10) -> int:
+        """Claims relay-fallback jobs (`executor='relay'`) abandoned by a
+        dead process — either stuck 'Queued' because the enqueuing process
+        crashed before its own self-claim ever ran, or stuck 'Running'
+        because the process running it crashed mid-job. `FOR UPDATE SKIP
+        LOCKED` means any number of processes can run this concurrently
+        with zero coordination: each claims a disjoint set of rows, the
+        same pattern psqldb_migrate.migration_lock's own polling already
+        establishes elsewhere in this codebase, applied here to individual
+        rows instead of one global lock.
+
+        Only ever touches this relay's own durable jobs: `executor='relay'`
+        excludes lineup-owned rows (lineup runs its own equivalent reaper —
+        see lineup/__init__.py's _reap_and_run_stale), and `payload IS NOT
+        NULL` excludes every row this table already had before durability
+        existed (a Scheduler-fired job, or a call enqueue() judged
+        ineligible) — there is nothing to reconstruct or run for either."""
+        started_at = datetime.now(timezone.utc)
+        lease_until = started_at + timedelta(seconds=_JOB_LEASE_SECONDS)
+        async with arc.psqldb.acquire() as conn:
+            claimed = await conn.fetch(
+                'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
+                "started_at=COALESCE(started_at, $4) "
+                "WHERE id IN ("
+                '  SELECT id FROM "_job_log" '
+                "  WHERE executor=$5 AND payload IS NOT NULL "
+                "    AND status IN ('Queued', 'Running') "
+                "    AND (lease_expires_at IS NULL OR lease_expires_at < now()) "
+                "  ORDER BY queued_at NULLS FIRST "
+                "  LIMIT $6 "
+                "  FOR UPDATE SKIP LOCKED"
+                ") RETURNING *",
+                "Running",
+                self._worker_id,
+                lease_until,
+                started_at,
+                "relay",
+                limit,
+            )
+        for row in claimed:
+            try:
+                await self._run_claimed_job_log_row(row)
+            except Exception as exc:  # noqa: BLE001 - already recorded on the row; keep reaping
+                self.log(f"reaped job {row['id']} failed: {exc}", level="error")
+        return len(claimed)

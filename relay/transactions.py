@@ -20,7 +20,13 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
-from .ambient import _MAX_WRITE_DEPTH, _active_conn, _postcommit_queue, _write_depth
+from .ambient import (
+    _MAX_WRITE_DEPTH,
+    _active_conn,
+    _postcommit_queue,
+    _postcommit_waiters,
+    _write_depth,
+)
 from .shapes import HookEvent, RelayError, _DryRunRollback
 
 
@@ -101,21 +107,54 @@ class TransactionsMixin:
         connection and is therefore its own real transaction."""
         outermost = new_transaction or _active_conn.get() is None
         token = _postcommit_queue.set([]) if outermost else None
+        waiters_token = _postcommit_waiters.set([]) if outermost else None
         deferred = _postcommit_queue.get()
         if deferred is None:  # defensive — only reachable if a caller nulls it mid-write
             deferred = []
         try:
             yield deferred
         except BaseException as exc:
-            if outermost and not dry_run:
-                await self._flush_postcommit(deferred, committed=False, error=exc)
+            if outermost:
+                # Resolve durable-enqueue waiters (background_jobs.py's
+                # enqueue()) BEFORE flushing hooks — a dry run never fails
+                # this way (_DryRunRollback is caught inside
+                # _transaction_or_dry_run, never reaches here), so
+                # `committed=False` here always means a genuine failure, and
+                # a job enqueued from inside it must never be dispatched.
+                self._resolve_postcommit_waiters(committed=False)
+                if not dry_run:
+                    await self._flush_postcommit(deferred, committed=False, error=exc)
             raise
         else:
-            if outermost and not dry_run:
-                await self._flush_postcommit(deferred, committed=True, error=None)
+            if outermost:
+                # Deliberately NOT gated on dry_run, unlike the hook flush
+                # just below: enqueue() has never taken dry_run into account
+                # (see ambient.py's _dry_run docstring — it protects a
+                # background job's OWN writes, not whether the job gets
+                # dispatched at all) and this durable path must not start
+                # now, silently, only during a real write.
+                self._resolve_postcommit_waiters(committed=True)
+                if not dry_run:
+                    await self._flush_postcommit(deferred, committed=True, error=None)
         finally:
             if token is not None:
                 _postcommit_queue.reset(token)
+            if waiters_token is not None:
+                _postcommit_waiters.reset(waiters_token)
+
+    @staticmethod
+    def _resolve_postcommit_waiters(*, committed: bool) -> None:
+        """Wakes every enqueue() call made from inside this write (see
+        ambient.py's _postcommit_waiters docstring) with the outermost
+        write's real fate. A future can already be done here if the task
+        awaiting it was itself cancelled before this ran — set_result would
+        raise InvalidStateError in that case, harmless to skip."""
+        waiters = _postcommit_waiters.get()
+        if not waiters:
+            return
+        for fut in waiters:
+            if not fut.done():
+                fut.set_result(committed)
 
     async def _flush_postcommit(
         self, deferred: list, *, committed: bool, error: BaseException | None

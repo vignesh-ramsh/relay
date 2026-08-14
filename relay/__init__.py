@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,7 @@ from .ambient import _active_conn as _active_conn
 from .ambient import _active_stream as _active_stream
 from .ambient import _dry_run as _dry_run
 from .ambient import _postcommit_queue as _postcommit_queue
+from .ambient import _postcommit_waiters as _postcommit_waiters
 from .ambient import _skip_hook_events as _skip_hook_events
 from .ambient import _write_depth as _write_depth
 from .background_jobs import BackgroundJobsMixin
@@ -183,6 +185,14 @@ class RelayProvider(
         # so one nothing else references can be garbage-collected mid-flight
         # and silently cancelled. Same fix authn already carries (§3.13).
         self._background_tasks: set[asyncio.Task] = set()
+        # Durable-queue identity + poller (background_jobs.py's
+        # _dispatch_durable_fallback/_reap_stale_jobs) — `_worker_id` is
+        # this PROCESS's claim identity (`_job_log.claimed_by`), distinct
+        # per RelayProvider instance so two test fixtures or two real
+        # processes never look like the same claimant. `_reap_task` is
+        # started/stopped by open()/close() below.
+        self._worker_id = f"relay-{uuid.uuid4().hex[:12]}"
+        self._reap_task: asyncio.Task | None = None
 
     # Hook registration/dispatch (register_hooks, add_hook, _decorator_for,
     # the 7 event properties, _has_hooks, _run_hooks, _run_hooks_resolved)
@@ -345,6 +355,29 @@ class RelayProvider(
             if self._kernel.has("lineup")
             else "in-process fallback",
         }
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle — async def open()/close(), the same duck-typed contract
+    # psqldb/redix/lineup already use (lineup/__init__.py's own lifecycle
+    # comment): Gateway's ASGI lifespan calls both automatically for every
+    # capability that has them. Relay itself holds no connection of its own
+    # to open — this exists purely to start/stop background_jobs.py's
+    # durable-queue reaper poll loop (_reap_loop -> _reap_stale_jobs),
+    # which needs a live process to keep polling, exactly like any other
+    # Postgres-backed work queue. A CLI-only process never calls this, so
+    # it never reaps — fine, reaping only matters for a long-running
+    # process in the first place.
+    # ------------------------------------------------------------------ #
+    async def open(self) -> None:
+        if self._reap_task is None:
+            self._reap_task = asyncio.create_task(self._reap_loop())
+
+    async def close(self) -> None:
+        if self._reap_task is not None:
+            self._reap_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reap_task
+            self._reap_task = None
 
 
 def register(kernel: Any) -> None:
