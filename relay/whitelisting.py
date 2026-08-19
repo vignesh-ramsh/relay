@@ -271,7 +271,7 @@ class WhitelistingMixin:
                     f"changed to roles=['Guest'] for genuinely public access)."
                 )
             name = f"{plugin}.{fn.__name__}"
-            derived_path = path or f"/api/method/{name}"
+            derived_path = path or f"/api/v1/{name}"
             # eval_str=True: many plugins write `from __future__ import
             # annotations`, which makes every annotation a plain STRING
             # (e.g. "int", not the type int) unless something evaluates it
