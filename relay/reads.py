@@ -260,6 +260,30 @@ class ReadsMixin:
         async with self._connection(new_transaction=new_transaction) as conn:
             return await conn.fetchval(sql, *params)
 
+    async def exists(
+        self,
+        table: str,
+        key: UUID | str | dict[str, Any],
+        *,
+        new_transaction: bool = False,
+    ) -> bool:
+        """Same lookup shape as get() — `key` a UUID/str means "by id", a
+        dict means the same equality/operator filter dict list()/count()
+        take (get()'s own `filters={"id": key}` sugar, reused here
+        identically) — but answers a yes/no question via SQL
+        EXISTS(... LIMIT 1) instead of fetching and materializing a row:
+        cheaper on a filter that matches many rows, since Postgres can
+        stop at the very first match rather than get() reading (and
+        deserializing) a whole row's worth of columns just to check it's
+        not None."""
+        schema = self._psqldb.schema(table)
+        filters = key if isinstance(key, dict) else {"id": key}
+        sql, params = query.build_exists(
+            table, schema, filters=filters, ref_columns=self._psqldb.ref_columns()
+        )
+        async with self._connection(new_transaction=new_transaction) as conn:
+            return await conn.fetchval(sql, *params)
+
     async def list_page(
         self,
         table: str,

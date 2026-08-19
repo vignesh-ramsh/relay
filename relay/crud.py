@@ -6,7 +6,7 @@ see HookContext — and postcommit hooks never share the ambient connection
 either, since by definition there's no live transaction left to share).
 
 create()/update() from earlier cuts are now private (_insert/_update) —
-save() below is the one public entry point (docs/relay/Sample.MD). Not
+save() below is the one public entry point (docs/arc-relay.MD §2.1). Not
 kept as deprecated aliases: this project carries no version number and no
 back-compat promise yet (docs/arc.MD §1).
 
@@ -162,11 +162,17 @@ class CrudMixin:
         match_on: list[str],
         filters: dict,
         *,
+        allow_insert: bool,
+        allow_update: bool,
         by: str | None,
         new_transaction: bool,
     ) -> dict:
         """The shared lookup-then-branch body save() runs either with or
-        without its own lock wrapped around it — see save() for which."""
+        without its own lock wrapped around it — see save() for which.
+        allow_insert/allow_update are checked HERE, not by the caller,
+        because which one applies depends on what this lookup finds —
+        save() itself doesn't know insert-vs-update for a match_on call
+        until this runs."""
         matches = await self.list(
             table, filters=filters, fields=["id"], limit=2, new_transaction=new_transaction
         )
@@ -176,9 +182,19 @@ class CrudMixin:
                 f"save() only ever affects exactly one row; use save_many() for a bulk match."
             )
         if matches:
+            if not allow_update:
+                raise query.QueryError(
+                    f"save(): match_on {filters} matched an existing row on '{table}', but "
+                    f"allow_update=False — refusing to update it."
+                )
             payload = {k: v for k, v in data.items() if k not in match_on}
             return await self._update(
                 table, matches[0]["id"], payload, by=by, new_transaction=new_transaction
+            )
+        if not allow_insert:
+            raise query.QueryError(
+                f"save(): match_on {filters} matched no existing row on '{table}', but "
+                f"allow_insert=False — refusing to insert a new one."
             )
         # The insert MUST happen while any lock the caller took is still
         # held — it used to sit after this block, so the lock was released
@@ -194,6 +210,8 @@ class CrudMixin:
         data: dict,
         *,
         match_on: list[str] | None = None,
+        allow_insert: bool = True,
+        allow_update: bool = True,
         by: str | None = None,
         new_transaction: bool = False,
         skip_hooks: bool = False,
@@ -203,7 +221,23 @@ class CrudMixin:
         skip_after_commit: bool = False,
         skip_on_rollback: bool = False,
     ) -> dict:
-        """Insert-or-update, one method (docs/relay/Sample.MD).
+        """Insert-or-update, one method (docs/arc-relay.MD §2.1).
+
+        allow_insert/allow_update (both default True — today's original
+        behavior, unchanged) let a caller block one side of that decision:
+        allow_insert=False for an "edit this record" endpoint that must
+        never silently create a new row if id/match_on didn't resolve to
+        one; allow_update=False for an import that should never overwrite
+        something that already exists. Checked AFTER the match_on lookup
+        (which branch would fire isn't known before that runs) but BEFORE
+        any hook or write — a blocked attempt never partially happens.
+        Passing both False is rejected immediately (QueryError): no call
+        could ever succeed with neither allowed. An explicit `id` still
+        always means "update, or a hard error if that id doesn't exist"
+        regardless of allow_insert — allow_insert never turns a not-found
+        id into an insert, it only gates the two branches that were
+        already capable of inserting (match_on-no-match, and
+        no-id-no-match_on).
 
         skip_hooks=True skips every hook this call would otherwise fire,
         for a bulk/import-style caller that wants raw psqldb-speed writes
@@ -256,6 +290,11 @@ class CrudMixin:
         existing `ctx.old`/`doc.is_new` contract — left as a documented,
         separate future increment, not silently attempted here.
         """
+        if not allow_insert and not allow_update:
+            raise query.QueryError(
+                "save(): allow_insert and allow_update cannot both be False — "
+                "at least one must stay True for this call to ever succeed."
+            )
         skip = _resolve_skip_events(
             skip_hooks,
             validate=skip_validate,
@@ -267,6 +306,11 @@ class CrudMixin:
         token = _skip_hook_events.set(skip)
         try:
             if data.get("id") is not None:
+                if not allow_update:
+                    raise query.QueryError(
+                        f"save(): '{table}' has allow_update=False, but an explicit id "
+                        f"always means update — omit the id (or use match_on) to insert instead."
+                    )
                 payload = {k: v for k, v in data.items() if k != "id"}
                 updated = await self._update(
                     table, data["id"], payload, by=by, new_transaction=new_transaction
@@ -282,7 +326,14 @@ class CrudMixin:
                 filters = {f: data[f] for f in match_on}
                 if self._match_on_is_constraint_backed(table, match_on):
                     return await self._resolve_match_on(
-                        table, data, match_on, filters, by=by, new_transaction=new_transaction
+                        table,
+                        data,
+                        match_on,
+                        filters,
+                        allow_insert=allow_insert,
+                        allow_update=allow_update,
+                        by=by,
+                        new_transaction=new_transaction,
                     )
                 # str() every value so the same logical key always locks the
                 # same name regardless of how the caller spelled it (UUID vs
@@ -292,9 +343,21 @@ class CrudMixin:
                 )
                 async with self.lock(lock_key):
                     return await self._resolve_match_on(
-                        table, data, match_on, filters, by=by, new_transaction=new_transaction
+                        table,
+                        data,
+                        match_on,
+                        filters,
+                        allow_insert=allow_insert,
+                        allow_update=allow_update,
+                        by=by,
+                        new_transaction=new_transaction,
                     )
 
+            if not allow_insert:
+                raise query.QueryError(
+                    f"save(): '{table}' has allow_insert=False, and no id/match_on was given "
+                    f"to update by — nothing to update, and inserting is not allowed."
+                )
             payload = {k: v for k, v in data.items() if k != "id"}
             return await self._insert(table, payload, by=by, new_transaction=new_transaction)
         finally:
@@ -460,6 +523,8 @@ class CrudMixin:
         rows: list[dict],
         *,
         match_on: list[str] | None = None,
+        allow_insert: bool = True,
+        allow_update: bool = True,
         by: str | None = None,
         limit: int | None = None,
         new_transaction: bool = False,
@@ -480,6 +545,19 @@ class CrudMixin:
         implicit cap (same "no cap unless you ask for one" philosophy as
         list()'s own `limit`). Neither id nor match_on -> insert.
 
+        allow_insert/allow_update (both default True) — same meaning as
+        save()'s own, but checked ONCE for the WHOLE batch after every
+        row's insert-or-update kind is resolved (id, then match_on
+        fan-out), before any hook or write runs: if allow_insert=False and
+        even one row in the batch would have been inserted, or
+        allow_update=False and even one row would have been updated, the
+        ENTIRE batch is rejected — consistent with save_many()'s existing
+        all-or-nothing contract (one row's problem already aborts
+        everything else here; this is just one more way a row can have a
+        problem). Passing both False is rejected immediately, same as
+        save(). An explicit `id` on a row still always means update for
+        that row regardless of allow_insert, same as save().
+
         Known simplification, not an oversight: unlike save(), this does
         NOT take a per-key arc.relay.lock() around match_on resolution —
         it's meant for bulk/import-style work, already inside one shared
@@ -493,6 +571,11 @@ class CrudMixin:
         (one skip decision per call, not per row) — exactly what a bulk
         import wants.
         """
+        if not allow_insert and not allow_update:
+            raise query.QueryError(
+                "save_many(): allow_insert and allow_update cannot both be False — "
+                "at least one must stay True for this call to ever succeed."
+            )
         skip = _resolve_skip_events(
             skip_hooks,
             validate=skip_validate,
@@ -623,6 +706,24 @@ class CrudMixin:
                                                 {k: v for k, v in row.items() if k != "id"},
                                             )
                                         )
+
+                            # Checked here — every row's insert-or-update
+                            # kind is now known, and nothing below this
+                            # point has touched a hook or written anything
+                            # yet — so a violation aborts the WHOLE batch
+                            # before any of it partially happens.
+                            if not allow_insert and any(kind == "insert" for kind, _rid, _data in resolved):
+                                raise query.QueryError(
+                                    f"save_many(): allow_insert=False, but at least one row on "
+                                    f"'{table}' would have been inserted (no id, and no match_on "
+                                    f"hit) — refusing the whole batch."
+                                )
+                            if not allow_update and any(kind == "update" for kind, _rid, _data in resolved):
+                                raise query.QueryError(
+                                    f"save_many(): allow_update=False, but at least one row on "
+                                    f"'{table}' would have been updated (id given, or match_on "
+                                    f"matched an existing row) — refusing the whole batch."
+                                )
 
                             for kind, _rid, data in resolved:
                                 if kind == "insert":

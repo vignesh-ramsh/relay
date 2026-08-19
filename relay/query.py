@@ -428,6 +428,21 @@ def build_count(
     return sql, params
 
 
+def build_exists(
+    table: str, schema: TableSchema, *, filters: dict[str, Any] | None, ref_columns: RefColumns
+) -> tuple[str, list[Any]]:
+    """SELECT EXISTS(... LIMIT 1), not count(*) > 0 — a filter matching
+    many rows still only needs Postgres to find ONE of them; count(*) has
+    no reason to stop early, EXISTS does."""
+    parsed, any_of_branches = parse_filters(schema, filters)
+    where_sql, params = render_where(table, parsed, any_of_branches, ref_columns, start=1)
+    inner = f'SELECT 1 FROM "{table}"'
+    if where_sql:
+        inner += f" WHERE {where_sql}"
+    inner += " LIMIT 1"
+    return f"SELECT EXISTS({inner})", params
+
+
 def build_aggregate(
     table: str,
     schema: TableSchema,
