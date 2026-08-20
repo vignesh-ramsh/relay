@@ -930,14 +930,47 @@ async def request_report(employee_id: str) -> dict:
     return {"ok": True, "queued": True}
 ```
 
-**Two very different behaviors depending on what's installed, same call:**
+**Three behaviors depending on what's installed AND what `fn` looks like,
+same call:**
 
 - **`lineup` installed:** durable — handed off to Redis (or Valkey,
   whichever `redix_url` points at); a separate `arc lineup worker` process
   actually runs it later, so it survives this process crashing/restarting.
-- **No `lineup`:** an in-process `asyncio.create_task()` fallback — runs
-  in this same process, right now, but is lost if the process dies before
-  it finishes. No retry, no persistence.
+- **No `lineup`, but `fn` is "durable-eligible":** ALSO durable, via a
+  Postgres outbox pattern — no Redis needed. `fn` qualifies if it's a
+  genuine, resolvable, module-level function (not a lambda or closure —
+  the same requirement `lineup` itself has) AND every argument survives a
+  JSON round trip. When it qualifies, `enqueue()` first writes a
+  `status="Queued"` row into `_job_log` containing everything needed to
+  re-run the job (module path, qualname, args, kwargs) — a real, committed
+  Postgres row, durable before anything runs — then immediately
+  self-claims it and runs it in-process, same near-zero latency as the
+  plain fallback always had. If this process dies before finishing, the
+  row is left claimed with a short lease; relay's own background poller
+  (started whenever `arc.relay.open()` runs — i.e. any process running
+  behind Gateway, independent of `lineup` entirely) notices the expired
+  lease every 15 seconds and re-runs the job from the row's own payload —
+  possibly in a completely different process than the one that originally
+  enqueued it. This is genuinely new: `enqueue()` used to be a pure
+  fire-and-forget `asyncio.create_task()` with nothing behind it at all
+  without `lineup`; it no longer is, for the common case of a plain
+  function with JSON-safe arguments.
+- **No `lineup`, and `fn` ISN'T durable-eligible** (a lambda, a closure, or
+  an argument that can't survive a JSON round trip — a live object, a
+  connection, ...): the original in-process `asyncio.create_task()`
+  fallback, genuinely unchanged — runs in this same process, right now,
+  but is lost if the process dies before it finishes. No retry, no
+  persistence. `_job_log` still gets a row, but only written AFTER the
+  fact, for history — there's nothing durable to recover from if the
+  process dies mid-job.
+
+**Caveat worth knowing:** the background poller that recovers a stuck
+durable-fallback job only runs in a process that calls `arc.relay.open()`
+— any process sitting behind Gateway, but NOT a one-off CLI invocation.
+Durability here means "survives this process crashing, provided some
+long-running Gateway process is around to notice and reap it" — a
+project that never runs Gateway at all (pure CLI/worker deployment, no
+`lineup` either) would have nothing polling for abandoned rows.
 
 Either way, it's still fire-and-forget from the caller's point of view —
 you get a `Task` back you can generally ignore.

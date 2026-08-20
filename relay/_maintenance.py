@@ -23,8 +23,6 @@ from `_trash` wouldn't mean anything useful anyway."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
 import arc
 
 DEFAULT_RETENTION_DAYS = 60
@@ -34,6 +32,6 @@ async def prune_job_log(older_than_days: int | None = None) -> int:
     if older_than_days is None:
         raw = arc.settings.get("job_log_retention_days")
         older_than_days = int(raw) if raw else DEFAULT_RETENTION_DAYS
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=older_than_days)
+    cutoff = arc.tz.ago(days=older_than_days)
     rows = await arc.relay.sql('DELETE FROM "_job_log" WHERE finished_at < $1 RETURNING id', cutoff)
     return len(rows)

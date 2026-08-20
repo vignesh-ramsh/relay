@@ -29,7 +29,6 @@ import asyncio
 import importlib.util
 import json
 import sys
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -250,7 +249,7 @@ class BackgroundJobsMixin:
         §3.15 — this is deliberately the ONLY surface a business plugin
         should ever call for this; never `arc.lineup.*` directly.
 
-        Three paths, in order:
+        Four paths, in order:
         1. `fn` is already a `@arc.relay.task(...)`-declared task
            (`arc.lineup.is_task(fn)`) — dispatched via its own `.kiq()`,
            on whatever queue it was declared with (`queue=` here is
@@ -262,24 +261,45 @@ class BackgroundJobsMixin:
            can't be re-imported by a worker process later) — dispatched
            via `arc.lineup.enqueue_by_path(fn, queue=queue, ...)`, no
            decorator or tasks/ file required at all.
-        3. No `lineup` installed — the original in-process
-           `asyncio.create_task()` fallback: lost on crash/restart, no
-           retry, no persistence, same as always (`queue=` has no meaning
-           here, there's no queue concept without lineup).
+        3. No `lineup`, but `fn` is "durable-eligible" — a genuine,
+           resolvable module-level function (same resolvability contract
+           as path 2's `check_resolvable`, checked here via
+           `_durable_job_reference()` instead since relay cannot import
+           lineup's own implementation) AND every arg/kwarg survives a
+           JSON round trip (`_json_safe()`). Durable via a Postgres outbox,
+           no Redis needed: `_dispatch_durable_fallback()` writes a
+           `status="Queued"` `_job_log` row FIRST (module path, qualname,
+           args, kwargs — everything needed to reconstruct and re-run the
+           call from the row alone), then immediately self-claims and runs
+           it in this process, same near-zero latency path 4 always had.
+           If this process dies before finishing, the row sits claimed
+           with a short lease; `_reap_loop` (started by `open()`, polling
+           every `_REAP_INTERVAL_SECONDS`, independent of `lineup`
+           entirely) reclaims and re-runs it later — possibly in a
+           different process. This ONLY runs in a process that calls
+           `open()` (behind Gateway, or anything else that opens relay
+           explicitly) — a one-off CLI invocation never polls.
+        4. Not durable-eligible (a lambda, a closure, or an argument that
+           can't survive a JSON round trip — a live object, a connection,
+           ...) — the original in-process `asyncio.create_task()`
+           fallback, genuinely unchanged: lost on crash/restart, no retry,
+           no persistence (`queue=` has no meaning here either).
 
-        The two durable paths (1, 2) and the fallback (3) have a real
-        semantic difference, not just an implementation swap: in the
-        fallback, the returned Task completing means `fn` actually
-        finished running, in THIS process. In a durable path, it means
-        the job was successfully handed off to Redis — actual execution
-        happens later, in a separate `arc lineup worker` process, and this
-        Task's own success/failure says nothing about whether that later
-        execution succeeds (there's no result backend wired up to report
-        that back yet, docs/arc.MD §8). Either way this stays fire-and-
-        forget from the caller's point of view — durable-fire-and-forget
-        instead of volatile-fire-and-forget.
+        Paths 1-3 are all durable now, not just 1-2 — path 3 is the newer
+        addition (a Postgres outbox, not Redis) and is what makes "no
+        `lineup` installed" no longer synonymous with "not durable" the
+        way it used to be; only path 4 (an ineligible `fn`) still is. The
+        semantic difference that matters: for path 4, the returned Task
+        completing means `fn` actually finished running, in THIS process.
+        For paths 1-3, it means the job was successfully HANDED OFF
+        (to Redis, or to the outbox row) — actual execution may happen
+        later, possibly in a different process, and this Task's own
+        success/failure says nothing about whether that later execution
+        succeeds (there's no result backend wired up to report that back
+        yet, docs/arc.MD §8). Either way this stays fire-and-forget from
+        the caller's point of view.
 
-        AMBIENT STATE (all three paths): the spawned task deliberately does
+        AMBIENT STATE (all four paths): the spawned task deliberately does
         NOT inherit the enclosing request's database connection, dry-run
         flag, deferred post-commit queue, or active stream — see
         _detach_request_scoped_state() for why each one is actively harmful
@@ -288,17 +308,21 @@ class BackgroundJobsMixin:
         immutable data and is what makes a queued job traceable back to the
         request and user that queued it.
 
-        In the in-process fallback that context is carried by the
-        contextvar itself. The durable `lineup` paths hand the job to
-        another PROCESS entirely, where a contextvar cannot reach — so it
-        travels as data instead: lineup stamps `context_labels()` onto the
-        TaskIQ message it kicks, and the worker rebinds them via
-        `use_context_labels()` around the job before running it. Either
-        way the `_job_log` row records `request_id`/`triggered_by`, so the
+        Path 3 and path 4 both capture it explicitly, once, at the call
+        site (`call_ctx = self.context()`, before either branch runs) —
+        not by relying on the contextvar copy `asyncio.create_task()` gives
+        the new task for free — so the `_job_log` row stays correct even
+        if the closure's own contextvar snapshot were ever changed
+        independently. The durable `lineup` paths (1, 2) hand the job to
+        another PROCESS entirely, where a contextvar cannot reach at all —
+        so it travels as data instead: lineup stamps `context_labels()`
+        onto the TaskIQ message it kicks, and the worker rebinds them via
+        `use_context_labels()` around the job before running it. Every
+        path's `_job_log` row records `request_id`/`triggered_by`, so the
         trail survives even after the process that queued the job is gone.
 
         DISPATCH TIMING when called from inside an active write (a hook):
-        none of the three paths above actually dispatch until the OUTERMOST
+        none of the four paths above actually dispatch until the OUTERMOST
         write's real fate is known — committed or rolled back. Building the
         Redis message / durable row eagerly, before that, used to mean a
         rolled-back write could still leave a job queued for data that was
@@ -411,7 +435,7 @@ class BackgroundJobsMixin:
         # fallback, completely unchanged: lost on crash/restart, no retry,
         # no persistence. `queue=` has no meaning here, there's no queue
         # concept without a durable record or lineup.
-        started_at = datetime.now(timezone.utc)
+        started_at = arc.tz.utcnow()
 
         async def _run_and_log() -> Any:
             # FIRST statement in the task: drop the enclosing request's
@@ -427,7 +451,7 @@ class BackgroundJobsMixin:
             finally:
                 # Best-effort — a DB hiccup writing the log row must never
                 # mask or replace the real task's own outcome above.
-                finished_at = datetime.now(timezone.utc)
+                finished_at = arc.tz.utcnow()
                 try:
                     await arc.psqldb.insert(
                         "_job_log",
@@ -499,7 +523,7 @@ class BackgroundJobsMixin:
         job outright over a failed logging-table write, the same
         "best-effort, must never mask the real outcome" posture the
         original _run_and_log() finally-block already used for logging."""
-        queued_at = datetime.now(timezone.utc)
+        queued_at = arc.tz.utcnow()
         try:
             # psqldb.insert() strips "id" as a system column and lets
             # Postgres default-generate it — so the row's real id comes
@@ -542,8 +566,8 @@ class BackgroundJobsMixin:
         `WHERE status='Queued'` makes a lost race a no-op, not a stolen
         claim: if a reaper pass already got there first, this simply
         updates zero rows and returns None."""
-        started_at = datetime.now(timezone.utc)
-        lease_until = started_at + timedelta(seconds=_JOB_LEASE_SECONDS)
+        started_at = arc.tz.utcnow()
+        lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         async with arc.psqldb.acquire() as conn:
             return await conn.fetchrow(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
@@ -571,7 +595,7 @@ class BackgroundJobsMixin:
         module_path, qualname = payload.get("module"), payload.get("qualname")
         args, kwargs = payload.get("args") or [], payload.get("kwargs") or {}
         row_id = row["id"]
-        started_at = row["started_at"] or datetime.now(timezone.utc)
+        started_at = row["started_at"] or arc.tz.utcnow()
         status, error = "success", None
         try:
             module = importlib.import_module(module_path)
@@ -583,7 +607,7 @@ class BackgroundJobsMixin:
             status, error = "failed", f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            finished_at = datetime.now(timezone.utc)
+            finished_at = arc.tz.utcnow()
             try:
                 async with arc.psqldb.acquire() as conn:
                     await conn.execute(
@@ -615,8 +639,8 @@ class BackgroundJobsMixin:
         NULL` excludes every row this table already had before durability
         existed (a Scheduler-fired job, or a call enqueue() judged
         ineligible) — there is nothing to reconstruct or run for either."""
-        started_at = datetime.now(timezone.utc)
-        lease_until = started_at + timedelta(seconds=_JOB_LEASE_SECONDS)
+        started_at = arc.tz.utcnow()
+        lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         async with arc.psqldb.acquire() as conn:
             claimed = await conn.fetch(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
