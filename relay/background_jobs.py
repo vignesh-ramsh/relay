@@ -122,6 +122,39 @@ class BackgroundJobsMixin:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _dispatch_module_allowed(self, module_path: str | None) -> bool:
+        """Whether `module_path` names code this project is willing to
+        import-and-call from a `_job_log` row's own payload.
+
+        _run_claimed_job_log_row below reconstructs a job purely from that
+        row — a JSONB column, not trusted source — so without this check
+        anyone who can write a `_job_log` row gets arbitrary code execution
+        in whichever process next reaps it (`("asyncio",
+        "create_subprocess_shell", ["..."], {})` is awaitable, so even the
+        `await target(...)` shape is no obstacle). That's the same hole
+        lineup's own generic dispatch task closed for its Redis-delivered
+        equivalent; this is deliberately the SAME rule, duplicated in small
+        rather than imported, for the same reason _durable_job_reference
+        above duplicates check_resolvable(): relay optionally depends on
+        lineup, never the reverse (module docstring), so it can't reach
+        into lineup's implementation even for a helper this identical.
+
+        Bounds dispatch to code belonging to this project: a module whose
+        root is an installed plugin's own package (flat layout: package
+        name == plugin name, §3.7), or one of the synthetic module names
+        relay/lineup's directory loaders register for api/hooks/tasks
+        files. Checked at RUN time, where it matters — enqueue()'s own
+        _durable_job_reference() is a convenience check, not a security
+        boundary (nothing forces a row to have come from enqueue() at
+        all)."""
+        if not module_path:
+            return False
+        root = module_path.split(".")[0]
+        if root.startswith("_arc_relay_") or root.startswith("_arc_lineup_"):
+            return True
+        caps = self._kernel.capabilities()
+        return root in {cap.plugin for cap in caps.values()} or root in caps
+
     # ------------------------------------------------------------------ #
     # Durable-queue lifecycle — RelayProvider.open()/close() (relay/
     # __init__.py) start/stop this poller the same way psqldb/redix/lineup
@@ -598,6 +631,12 @@ class BackgroundJobsMixin:
         started_at = row["started_at"] or arc.tz.utcnow()
         status, error = "success", None
         try:
+            if not self._dispatch_module_allowed(module_path):
+                raise PermissionError(
+                    f"refusing to run '{module_path}.{qualname}' from _job_log row "
+                    f"{row_id} — its root module is not an installed ARC plugin "
+                    f"package (or a relay/lineup-loaded module)."
+                )
             module = importlib.import_module(module_path)
             target: Any = module
             for part in qualname.split("."):
