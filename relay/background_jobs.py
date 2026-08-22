@@ -26,9 +26,11 @@ is one of several mixins RelayProvider (relay/__init__.py) inherits from;
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -38,15 +40,21 @@ from .ambient import _active_conn, _active_stream, _dry_run, _postcommit_queue, 
 
 # How long a claim on a _job_log row is honored before another poller (this
 # process's own reaper, or another process's) treats it as abandoned and
-# re-claims it. Deliberately generous relative to _REAP_INTERVAL_SECONDS —
-# a lease that expired only means "nobody has RENEWED it," which for a
-# fire-and-forget job that hasn't been made to heartbeat is indistinguishable
-# from "still running, just slow" until it's well past due; the cost of
-# guessing wrong here is a job re-run early (a duplicate-execution risk the
-# caller already accepts by using a background job at all — no different
-# from lineup's own at-most-once-per-attempt, best-effort semantics), not
-# data loss, so this leans toward "wait it out" rather than "reclaim eagerly."
+# re-claims it. A job that's still genuinely running past this now HAS a
+# heartbeat renewing it (_run_claimed_job_log_row's own background task,
+# below) — this only ever actually lapses when that heartbeat itself
+# stops (a real crash, a hung event loop), not merely "the job ran long,"
+# which used to be indistinguishable from a dead process and meant EVERY
+# job over 60s was guaranteed to be reaped and double-executed by another
+# poller. The lease is the crash-recovery signal now; the heartbeat is
+# what keeps a merely-slow job from ever tripping it.
 _JOB_LEASE_SECONDS = 60
+# How often the heartbeat renews a still-running claim — a third of the
+# lease, the same margin redix's own _RenewingLock uses (its docstring:
+# "enough headroom that one slow/dropped renewal doesn't cost the lock
+# outright, without renewing so often it meaningfully adds load"), applied
+# here to the identical shape of problem.
+_LEASE_RENEW_INTERVAL_SECONDS = _JOB_LEASE_SECONDS / 3
 # How often RelayProvider's own poller (started in open(), see relay/
 # __init__.py) checks for abandoned rows. Independent of lineup entirely —
 # this exists so `arc.relay.enqueue()`'s in-process fallback survives a
@@ -598,20 +606,76 @@ class BackgroundJobsMixin:
         this process's own INSERT, where it's virtually always uncontested.
         `WHERE status='Queued'` makes a lost race a no-op, not a stolen
         claim: if a reaper pass already got there first, this simply
-        updates zero rows and returns None."""
+        updates zero rows and returns None.
+
+        Stamps a fresh `claim_token` (a random uuid, not a business
+        value) alongside the lease — see _run_claimed_job_log_row's own
+        docstring for what it fences against."""
         started_at = arc.tz.utcnow()
         lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
+        claim_token = uuid.uuid4().hex
         async with arc.psqldb.acquire() as conn:
             return await conn.fetchrow(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
-                'started_at=$4 WHERE id=$5 AND status=$6 RETURNING *',
+                'started_at=$4, claim_token=$5 WHERE id=$6 AND status=$7 RETURNING *',
                 "Running",
                 self._worker_id,
                 lease_until,
                 started_at,
+                claim_token,
                 row_id,
                 "Queued",
             )
+
+    async def _heartbeat_job_lease(self, row_id: Any, claim_token: str) -> None:
+        """Runs for as long as _run_claimed_job_log_row is actually
+        executing the job's own target(...) coroutine — renews
+        lease_expires_at every _LEASE_RENEW_INTERVAL_SECONDS so a job that
+        merely runs long never looks abandoned to _reap_stale_jobs. Same
+        shape as redix._RenewingLock._renew_loop (sleep, try renew, stop
+        quietly if it's no longer ours), duplicated here in small rather
+        than shared — relay optionally depends on redix, never requires
+        it, and this heartbeat has to work identically with or without
+        redix installed at all.
+
+        Every UPDATE (this one, and the final status write in
+        _run_claimed_job_log_row's own finally block) is conditioned on
+        `claim_token` matching, not just `id` — if a heartbeat write ever
+        affects zero rows, another poller has already reclaimed this row
+        (this process was gone long enough for its lease to lapse before
+        this renewal reached the database), and continuing to "renew" a
+        claim that's no longer ours would just fight the new claimant for
+        the same row. Stops, rather than trying to reacquire — the row
+        belongs to whoever holds the current token now."""
+        try:
+            while True:
+                await asyncio.sleep(_LEASE_RENEW_INTERVAL_SECONDS)
+                lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS)
+                try:
+                    async with arc.psqldb.acquire() as conn:
+                        renewed = await conn.fetchval(
+                            'UPDATE "_job_log" SET lease_expires_at=$1 '
+                            "WHERE id=$2 AND claim_token=$3 RETURNING id",
+                            lease_until,
+                            row_id,
+                            claim_token,
+                        )
+                except Exception as exc:  # noqa: BLE001 - a missed renewal isn't fatal on its own
+                    self.log(
+                        f"lease heartbeat for job {row_id} failed to write ({exc}) — "
+                        f"will retry next interval",
+                        level="warning",
+                    )
+                    continue
+                if renewed is None:
+                    self.log(
+                        f"lease heartbeat for job {row_id}: claim token no longer matches — "
+                        f"another poller has already reclaimed it; stopping renewal",
+                        level="warning",
+                    )
+                    return
+        except asyncio.CancelledError:
+            pass
 
     async def _run_claimed_job_log_row(self, row: Any) -> Any:
         """Reconstructs and runs a job purely from an already-claimed
@@ -623,12 +687,33 @@ class BackgroundJobsMixin:
         recovery, not the first attempt." Re-raises on failure (after
         recording it on the row) so a direct caller's own done-callback
         still logs it — _reap_stale_jobs() catches around each call for
-        exactly that reason, so one bad job doesn't stop the reap pass."""
+        exactly that reason, so one bad job doesn't stop the reap pass.
+
+        Runs a background lease heartbeat (_heartbeat_job_lease) for the
+        duration of the job — see its own docstring — and writes the
+        FINAL status only if `claim_token` still matches this claim.
+        Without that guard, a genuinely-abandoned execution (the rare case
+        the heartbeat itself couldn't save — a real crash, a hung event
+        loop) that somehow still limped to completion afterward could
+        silently overwrite whatever the NEW claimant already recorded —
+        marking a job "success" here after someone else already reran and
+        recorded "failed" (or vice versa) would be a duplicated, out-of-
+        order side effect on the bookkeeping itself, exactly the class of
+        bug idempotency is meant to close. This can't stop target(...)
+        itself from having run twice — relay has no visibility into what
+        a caller's own job actually does — but it does guarantee this
+        row's own status/error/duration reflect whichever execution
+        legitimately holds the claim, never a stale one clobbering a
+        fresher one."""
         payload = row["payload"] or {}
         module_path, qualname = payload.get("module"), payload.get("qualname")
         args, kwargs = payload.get("args") or [], payload.get("kwargs") or {}
         row_id = row["id"]
+        claim_token = row["claim_token"]
         started_at = row["started_at"] or arc.tz.utcnow()
+        heartbeat = self._track_task(
+            asyncio.create_task(self._heartbeat_job_lease(row_id, claim_token))
+        )
         status, error = "success", None
         try:
             if not self._dispatch_module_allowed(module_path):
@@ -646,17 +731,28 @@ class BackgroundJobsMixin:
             status, error = "failed", f"{type(exc).__name__}: {exc}"
             raise
         finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
             finished_at = arc.tz.utcnow()
             try:
                 async with arc.psqldb.acquire() as conn:
-                    await conn.execute(
+                    updated = await conn.fetchval(
                         'UPDATE "_job_log" SET status=$1, error=$2, finished_at=$3, '
-                        "duration_ms=$4 WHERE id=$5",
+                        "duration_ms=$4 WHERE id=$5 AND claim_token=$6 RETURNING id",
                         status,
                         error,
                         finished_at,
                         int((finished_at - started_at).total_seconds() * 1000),
                         row_id,
+                        claim_token,
+                    )
+                if updated is None:
+                    self.log(
+                        f"job {row_id} finished ({status}) but its claim was already "
+                        f"reclaimed by another poller — not overwriting that poller's "
+                        f"own result",
+                        level="warning",
                     )
             except Exception as log_exc:  # noqa: BLE001 - must not mask the job's own outcome
                 self.log(f"failed to write finished _job_log row {row_id}: {log_exc}", level="error")
@@ -665,7 +761,10 @@ class BackgroundJobsMixin:
         """Claims relay-fallback jobs (`executor='relay'`) abandoned by a
         dead process — either stuck 'Queued' because the enqueuing process
         crashed before its own self-claim ever ran, or stuck 'Running'
-        because the process running it crashed mid-job. `FOR UPDATE SKIP
+        because the process running it crashed mid-job (a heartbeat means
+        "still Running" no longer ALSO means "merely slow" — see
+        _heartbeat_job_lease's own docstring; a lapsed lease past this
+        point really does mean nobody is renewing it). `FOR UPDATE SKIP
         LOCKED` means any number of processes can run this concurrently
         with zero coordination: each claims a disjoint set of rows, the
         same pattern psqldb_migrate.migration_lock's own polling already
@@ -677,32 +776,50 @@ class BackgroundJobsMixin:
         see lineup/__init__.py's _reap_and_run_stale), and `payload IS NOT
         NULL` excludes every row this table already had before durability
         existed (a Scheduler-fired job, or a call enqueue() judged
-        ineligible) — there is nothing to reconstruct or run for either."""
+        ineligible) — there is nothing to reconstruct or run for either.
+
+        One fresh `claim_token` for the WHOLE batch this pass claims, not
+        one per row — uuid4() is already globally unique per call, and
+        fencing only needs "is this specific claim-instance still active
+        for this row," which a shared per-pass token still guarantees
+        against any FUTURE reclaim (which always gets its own fresh
+        token); generating N tokens for N rows would guard nothing extra.
+
+        Dispatches every claimed row concurrently (asyncio.gather), not
+        serially — a serial await here previously meant row N's own lease
+        clock (already ticking since ITS claim UPDATE above) burned down
+        while rows 1..N-1 ran first, shrinking its real runway before its
+        own heartbeat could even start."""
         started_at = arc.tz.utcnow()
         lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
+        claim_token = uuid.uuid4().hex
         async with arc.psqldb.acquire() as conn:
             claimed = await conn.fetch(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
-                "started_at=COALESCE(started_at, $4) "
+                "started_at=COALESCE(started_at, $4), claim_token=$5 "
                 "WHERE id IN ("
                 '  SELECT id FROM "_job_log" '
-                "  WHERE executor=$5 AND payload IS NOT NULL "
+                "  WHERE executor=$6 AND payload IS NOT NULL "
                 "    AND status IN ('Queued', 'Running') "
                 "    AND (lease_expires_at IS NULL OR lease_expires_at < now()) "
                 "  ORDER BY queued_at NULLS FIRST "
-                "  LIMIT $6 "
+                "  LIMIT $7 "
                 "  FOR UPDATE SKIP LOCKED"
                 ") RETURNING *",
                 "Running",
                 self._worker_id,
                 lease_until,
                 started_at,
+                claim_token,
                 "relay",
                 limit,
             )
-        for row in claimed:
+
+        async def _run_and_log(row: Any) -> None:
             try:
                 await self._run_claimed_job_log_row(row)
             except Exception as exc:  # noqa: BLE001 - already recorded on the row; keep reaping
                 self.log(f"reaped job {row['id']} failed: {exc}", level="error")
+
+        await asyncio.gather(*(_run_and_log(row) for row in claimed))
         return len(claimed)
