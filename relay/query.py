@@ -53,6 +53,19 @@ MAX_ORDER_FIELDS = 5
 MAX_AGGREGATES = 10
 MAX_ANY_OF_BRANCHES = 10
 
+# Only `like`/`ilike` (_LIKE_OPS) need these — unlike contains/startswith/
+# endswith (_LIKE_WRAP_OPS), those pass the caller's ENTIRE pattern to
+# Postgres verbatim, wildcards and all, instead of escaping the caller's
+# value first and adding at most two wildcards of the engine's own
+# choosing. Postgres's LIKE matcher backtracks; a pattern like
+# "%_%_%_%_%_%_%x" is a cheap CPU-burn primitive once nothing bounds how
+# many wildcards a caller can pack in. See admin.api.data_api._search_where
+# for the sibling ILIKE surface — already safe by construction (it always
+# escapes the caller's term before wrapping it), so it only needed a
+# search-TERM-count bound, not this one.
+MAX_LIKE_PATTERN_LENGTH = 200
+MAX_LIKE_WILDCARDS = 10
+
 #: Reserved top-level filter key — see parse_filters()'s any_of handling
 #: and the module docstring's "Scope" section above.
 ANY_OF_KEY = "any_of"
@@ -176,6 +189,19 @@ def parse_filters(
             )
         if op in _SET_OPS and not isinstance(value, (list, tuple)):
             raise QueryError(f"filter '{name}': '{op}' requires a list of values, got {value!r}.")
+        if op in _LIKE_OPS:
+            if not isinstance(value, str):
+                raise QueryError(f"filter '{name}': '{op}' requires a string pattern, got {value!r}.")
+            if len(value) > MAX_LIKE_PATTERN_LENGTH:
+                raise QueryError(
+                    f"filter '{name}': '{op}' pattern exceeds {MAX_LIKE_PATTERN_LENGTH} characters."
+                )
+            wildcards = value.count("%") + value.count("_")
+            if wildcards > MAX_LIKE_WILDCARDS:
+                raise QueryError(
+                    f"filter '{name}': '{op}' pattern has {wildcards} wildcards, "
+                    f"more than {MAX_LIKE_WILDCARDS} allowed."
+                )
         parsed.append((field, op, value))
 
     any_of_branches: list[ParsedFilters] = []
