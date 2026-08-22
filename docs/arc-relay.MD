@@ -1335,6 +1335,38 @@ want it schedulable or resolvable by name across processes.
 
 ---
 
+## 17. Recent Security & Correctness Fixes
+
+- **Raw `like`/`ilike` filters now bound pattern length (≤200 chars) and
+  wildcard count (≤10 `%`/`_`)** — `MAX_LIKE_PATTERN_LENGTH` /
+  `MAX_LIKE_WILDCARDS` in `query.py`. Unlike `contains`/`startswith`/
+  `endswith` (which always escape the caller's value before wrapping it
+  in at most two engine-chosen wildcards), raw `like`/`ilike` pass the
+  caller's entire pattern to Postgres verbatim — an unbounded wildcard
+  count (`%_%_%_%_%_%_%x`) is a cheap CPU-burn primitive against
+  Postgres's backtracking LIKE matcher. Coordinates with, doesn't
+  duplicate, admin's `_search_where` term-count bound (already safe by
+  construction, since it always escapes the caller's term first).
+- **The durable job reaper refuses to dispatch a `_job_log` payload whose
+  module isn't an installed plugin** — closing a path where a crafted or
+  stale row's `module` field could otherwise get imported and called.
+- **The durable job reaper now heartbeats its lease and fences completion
+  with a `claim_token`**, instead of a single claim-at-start with no
+  renewal. A long-running job whose lease expired before it finished
+  could previously be picked up a second time by another
+  worker/process — the heartbeat extends the lease periodically while
+  the job is genuinely still running, and the `claim_token` check on the
+  final UPDATE stops a stale, already-reaped worker from corrupting the
+  bookkeeping of a job someone else has since reclaimed. See lineup's own
+  doc for the identical fix mirrored there (no cross-import between the
+  two — each carries its own copy, deliberately).
+- **`headers` added to `_INJECTED_PARAM_NAMES`** — a whitelisted function
+  can now declare a `headers` parameter (like `identity`/`client_ip`) and
+  receive the real request headers, without that param name being
+  mistaken for a caller-supplied filter/body key.
+
+---
+
 **In one sentence:** Relay is the one facade every business plugin writes
 against for reading/writing rows (with hooks reacting to every write),
 exposing functions to the outside world (with role-based access control
