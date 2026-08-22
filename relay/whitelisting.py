@@ -47,15 +47,28 @@ from .shapes import CallContext, RelayError, RelayStream, WhitelistedFunction
 # fallback on any endpoint that hasn't deliberately restricted `methods`.
 ALL_METHODS = ("GET", "QUERY", "POST", "PUT", "PATCH", "DELETE")
 
-# Injected by _wire_gateway_route itself (identity/client_ip/cookies/request/
-# dry_run/request_id) — never sourced from the caller's own query/body/path,
-# so these names are never candidates for the coercion/payload inspection
-# below, whatever a function happens to annotate them as. request_id in
-# particular MUST be here rather than left to ordinary kwarg handling: an
-# inbound `?request_id=...` would otherwise let a caller forge its own
-# correlation id straight into the logs.
+# Injected by _wire_gateway_route itself (identity/client_ip/cookies/
+# headers/request/dry_run/request_id) — never sourced from the caller's
+# own query/body/path, so these names are never candidates for the
+# coercion/payload inspection below, whatever a function happens to
+# annotate them as. request_id in particular MUST be here rather than
+# left to ordinary kwarg handling: an inbound `?request_id=...` would
+# otherwise let a caller forge its own correlation id straight into the
+# logs. `headers` belongs here for the identical reason `cookies`/
+# `client_ip` already are — it's server-derived (wf.wants_headers,
+# shapes.py's own docstring), not a caller-supplied kwarg — and its
+# ABSENCE here was a real bug, not just an inconsistency: a
+# Struct-payload function that also declares `headers` (wf.wants_headers
+# AND wf.payload_type both set) had its injected headers dict swept into
+# _build_payload's own payload_source below (validated against the
+# Struct as if the caller had sent it, which it never did) AND dropped
+# entirely from the final kwargs `_wire_gateway_route` calls `fn` with
+# (its own `{wf.payload_param: payload, **{k: v for k, v in kwargs.items()
+# if k in _INJECTED_PARAM_NAMES}}` reconstruction only keeps names in
+# THIS set) — such a function received no `headers` argument at all,
+# despite having explicitly asked for one.
 _INJECTED_PARAM_NAMES = frozenset(
-    {"identity", "client_ip", "cookies", "request", "dry_run", "request_id"}
+    {"identity", "client_ip", "cookies", "headers", "request", "dry_run", "request_id"}
 )
 
 # Every scalar type arc.codec (msgspec) can coerce a raw string into —
