@@ -2,7 +2,7 @@
 
 Mounted via the `arc.plugins.cli` entry point, same mechanism as every
 other plugin's CLI. `prune-job-log` does a real `arc.boot()` + opens
-psqldb (same reason authn's admin CLI needs a real boot, §3.13) — it
+pgdb (same reason authn's admin CLI needs a real boot, §3.13) — it
 exists specifically for the no-`lineup`-installed case, where relay's own
 `@arc.relay.task(cron=...)` maintenance job (relay/_maintenance.py) has
 no scheduler to fire it automatically; run this by hand or from an

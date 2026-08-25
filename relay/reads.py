@@ -42,7 +42,7 @@ from .resolvers import FieldResolver
 # settings (used the first time a project boots, before anyone has run
 # `arc settings set` for either key) — the numbers actually in effect
 # always come from self._list_default_limit/_list_max_limit, resolved once
-# in register() from arc.settings, same pattern as psqldb's own
+# in register() from arc.settings, same pattern as pgdb's own
 # POOL_MIN_SIZE_KEY/POOL_MAX_SIZE_KEY.
 RELAY_LIST_DEFAULT_LIMIT_KEY = "relay_list_default_limit"
 RELAY_LIST_MAX_LIMIT_KEY = "relay_list_max_limit"

@@ -339,7 +339,7 @@ class CallContext:
     """
 
     request_id: str | None = None
-    user: str | None = None  # the acting user's EMAIL — same value psqldb's
+    user: str | None = None  # the acting user's EMAIL — same value pgdb's
     # created_by/updated_by audit columns store (never a UUID)
     roles: tuple[str, ...] = ()
 

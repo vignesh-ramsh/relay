@@ -1,5 +1,5 @@
 """Hook registration — plugins/<plugin>/hooks/<Table Name>.py, same
-filename-to-table convention as schemas/patches (psqldb.model).
+filename-to-table convention as schemas/patches (pgdb.model).
 
 Split out of relay/__init__.py for maintainability — HooksMixin is one of
 several mixins RelayProvider (relay/__init__.py) inherits from; `self` is
@@ -29,7 +29,7 @@ class HooksMixin:
     def register_hooks(self, hooks_dir: str | Path) -> None:
         from pgdb.model import (
             slugify_table_name,
-        )  # only dependency Relay takes on psqldb's internals
+        )  # only dependency Relay takes on pgdb's internals
 
         hooks_dir = Path(hooks_dir)
         if not hooks_dir.exists():
@@ -37,7 +37,7 @@ class HooksMixin:
         plugin = self._kernel.current_plugin() or "<direct>"
         for path in sorted(hooks_dir.glob("*.py")):
             # system=True only preserves a leading "_" when the filename itself
-            # has one (psqldb.model.slugify_table_name) — safe unconditionally,
+            # has one (pgdb.model.slugify_table_name) — safe unconditionally,
             # a non-underscore filename like "Employee.py" is unaffected. Without
             # this, a hook file for a "system": true table (e.g. "_users.py")
             # would resolve to table key "users", never matching the real table

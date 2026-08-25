@@ -1,9 +1,9 @@
 """
 relay — ARC application runtime (Architecture §2/§3.4).
 
-Exports `arc.relay`: hook-wrapped CRUD over whatever tables `psqldb` has
+Exports `arc.relay`: hook-wrapped CRUD over whatever tables `pgdb` has
 already declared (schemas/patches, §3.9) — Relay never redeclares the data
-model, it only attaches behavior to one psqldb already owns. Single-row +
+model, it only attaches behavior to one pgdb already owns. Single-row +
 batch writes (save/save_many/delete/delete_many), the full hook taxonomy,
 cache/lock/queue, whitelisting with full role-intersection RBAC (§3.11/
 §3.13), and the bounded Query Engine (get/list/count/aggregate/sql — see
@@ -28,7 +28,7 @@ Two things worth knowing before reading the CRUD section below:
     they were — doc is an additional, friendlier layer over the same data,
     not a replacement.
 
-requires=["psqldb"]: the only hard dependency — a Resource with nothing to
+requires=["pgdb"]: the only hard dependency — a Resource with nothing to
 store isn't a Resource. optional_requires=["authn", "redix", "gateway"]:
 all three are used by LATER increments (RBAC, cache/lock/queue, whitelisted
 routes) and are harmless to declare now even though this cut doesn't touch
@@ -358,7 +358,7 @@ class RelayProvider(
 
     # ------------------------------------------------------------------ #
     # Lifecycle — async def open()/close(), the same duck-typed contract
-    # psqldb/redix/lineup already use (lineup/__init__.py's own lifecycle
+    # pgdb/redix/lineup already use (lineup/__init__.py's own lifecycle
     # comment): Gateway's ASGI lifespan calls both automatically for every
     # capability that has them. Relay itself holds no connection of its own
     # to open — this exists purely to start/stop background_jobs.py's

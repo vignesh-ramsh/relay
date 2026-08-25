@@ -2,16 +2,16 @@
 relay.query
 -------------------
 The bounded Query Engine (Architecture §3.4) — filters, ordering, pagination,
-single-hop relation resolution, and aggregates. Lives in Relay, not psqldb
-(psqldb only ever executes SQL — arc.pgdb.fetch/fetch_one/fetch_val/execute
+single-hop relation resolution, and aggregates. Lives in Relay, not pgdb
+(pgdb only ever executes SQL — arc.pgdb.fetch/fetch_one/fetch_val/execute
 — and holds the schema registry every table's shape is read from; Relay is
 where the vocabulary of "what a filter/field/order_by means" is decided and
 turned into one parameterized SQL string).
 
 Everything below is a pure function: schema in, (sql, params) out, no I/O,
-no `psqldb` import beyond the type hints on Field/TableSchema (the same,
+no `pgdb` import beyond the type hints on Field/TableSchema (the same,
 already-established minimal exception RelayProvider.register_hooks() takes
-on psqldb.model.slugify_table_name — see relay/__init__.py). That purity is
+on pgdb.model.slugify_table_name — see relay/__init__.py). That purity is
 deliberate: this is the first genuinely unit-testable surface in the project
 (no live Postgres needed to assert what SQL a given filter dict produces),
 which matters more here than anywhere else — this is "the single riskiest
@@ -29,7 +29,7 @@ Scope, stated plainly (not an oversight list — a boundary):
     arc.relay.resolve(field, subfields), never implicitly.
   * resolve() is ONE hop deep, through REFERENCE fields only. A REFERENCE
     field's bare column value is already the target's real business key by
-    default now (psqldb's target_field, docs/arc.MD) — resolve() is for
+    default now (pgdb's target_field, docs/arc.MD) — resolve() is for
     pulling ADDITIONAL fields off the related row, not for reading the
     relation itself.
   * aggregates: group_by + count/sum/avg/min/max, no HAVING, no resolve().
@@ -40,10 +40,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-# Another deliberate, minimal dependency Relay takes on psqldb's internals —
+# Another deliberate, minimal dependency Relay takes on pgdb's internals —
 # same exception §3.2 already carves out for register_hooks()'s
 # slugify_table_name import: type hints only, not a second query-building
-# implementation duplicating psqldb's own field/schema knowledge.
+# implementation duplicating pgdb's own field/schema knowledge.
 from pgdb.fields import Field
 from pgdb.model import TableSchema
 
@@ -90,7 +90,7 @@ _ALL_OPS = (
 )
 _AGG_FNS = frozenset({"count", "sum", "avg", "min", "max"})
 
-# psqldb.migrate.ddl.RefColumn's shape, duck-typed here (table/column/sql_type
+# pgdb.migrate.ddl.RefColumn's shape, duck-typed here (table/column/sql_type
 # attributes) rather than imported — RelayProvider passes arc.pgdb.ref_columns()
 # straight through; this module never constructs one itself.
 RefColumns = dict[tuple[str, str], Any]
@@ -132,8 +132,8 @@ def _escape_like(value: str) -> str:
 def _field_sql_type(table: str, field: Field, ref_columns: RefColumns) -> str:
     """The field's REAL physical SQL type — field.sql_type() alone is wrong
     for a REFERENCE field with a non-default target_field (it always
-    returns "UUID"; see Field.target_field's docstring in psqldb.fields).
-    Same helper shape as the fix already applied to psqldb's update_many."""
+    returns "UUID"; see Field.target_field's docstring in pgdb.fields).
+    Same helper shape as the fix already applied to pgdb's update_many."""
     if field.type == "REFERENCE":
         return ref_columns[(table, field.name)].sql_type
     return field.sql_type()
@@ -394,7 +394,7 @@ def build_select(
                 raise QueryError(f"'{item.field}' on table '{table}' has no resolvable target.")
             target_schema = schema_lookup(
                 ref.table
-            )  # raises psqldb.SchemaError if somehow missing
+            )  # raises pgdb.SchemaError if somehow missing
             target_columns = target_schema.columns_by_name
             unknown = [sf for sf in item.subfields if sf not in target_columns]
             if unknown:

@@ -13,7 +13,7 @@ If you only read one section, read **"The Big Picture"**.
 
 ## 1. The Big Picture
 
-`psqldb` (a separate plugin) owns the **shape** of your data — table
+`pgdb` (a separate plugin) owns the **shape** of your data — table
 schemas, columns, types. `arc.relay` is everything you actually **do** with
 that data:
 
@@ -32,7 +32,7 @@ that data:
   when it's installed, and quietly fall back to something weaker but still
   useful when it isn't.
 
-**Mental model:** psqldb is the filing cabinet (labeled drawers, labeled
+**Mental model:** pgdb is the filing cabinet (labeled drawers, labeled
 folders). Relay is the person at the desk who actually opens drawers, files
 new paperwork, double-checks it before filing (hooks), answers the phone
 when someone calls in asking for something (whitelisted functions), and
@@ -79,7 +79,7 @@ manually list or import them.
 
 ## 2. CRUD — Reading and Writing Rows
 
-Every method below works on ANY table psqldb knows about — you never
+Every method below works on ANY table pgdb knows about — you never
 declare a table to relay itself, only which one you're operating on, by
 name.
 
@@ -164,7 +164,7 @@ plain no-id-no-`match_on`).
 
 ### 2.2 `await arc.relay.delete(table, id, ...)`
 
-**What it does:** Soft-deletes one row by id (moves it to trash — psqldb's
+**What it does:** Soft-deletes one row by id (moves it to trash — pgdb's
 own concern, not something relay decides).
 
 **When to use it:** Deleting a single row.
@@ -1370,5 +1370,5 @@ want it schedulable or resolvable by name across processes.
 **In one sentence:** Relay is the one facade every business plugin writes
 against for reading/writing rows (with hooks reacting to every write),
 exposing functions to the outside world (with role-based access control
-built in), running background work, and caching/locking — psqldb owns the
+built in), running background work, and caching/locking — pgdb owns the
 data's shape, relay owns everything you actually do with it.

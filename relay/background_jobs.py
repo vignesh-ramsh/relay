@@ -165,7 +165,7 @@ class BackgroundJobsMixin:
 
     # ------------------------------------------------------------------ #
     # Durable-queue lifecycle — RelayProvider.open()/close() (relay/
-    # __init__.py) start/stop this poller the same way psqldb/redix/lineup
+    # __init__.py) start/stop this poller the same way pgdb/redix/lineup
     # start their own connections, via Gateway's ASGI lifespan calling both
     # automatically for any capability that has them. A CLI-only process
     # (not behind Gateway) never calls open(), so it never runs this loop —
@@ -566,7 +566,7 @@ class BackgroundJobsMixin:
         original _run_and_log() finally-block already used for logging."""
         queued_at = arc.tz.utcnow()
         try:
-            # psqldb.insert() strips "id" as a system column and lets
+            # pgdb.insert() strips "id" as a system column and lets
             # Postgres default-generate it — so the row's real id comes
             # back from the INSERT's own RETURNING *, not from anything
             # chosen up front.

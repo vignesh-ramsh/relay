@@ -1,5 +1,5 @@
 """CRUD — single-row and batch writes. Every write runs inside ONE
-transaction spanning precommit hooks + the actual psqldb write; postcommit
+transaction spanning precommit hooks + the actual pgdb write; postcommit
 hooks run strictly after that transaction has resolved AND its connection
 has been released back to the pool (ctx.conn is None by then on purpose —
 see HookContext — and postcommit hooks never share the ambient connection
@@ -88,7 +88,7 @@ class CrudMixin:
                         await self._run_hooks(table, "validate", ctx)
                         await self._run_hooks(table, "before_save", ctx)
                         row = await self._psqldb.insert(table, ctx.payload, created_by=by, conn=conn)
-                        ctx.new = row  # psqldb.insert() already returns a plain dict
+                        ctx.new = row  # pgdb.insert() already returns a plain dict
                         ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
                         await self._run_hooks(table, "after_save", ctx)
                 except Exception as exc:
@@ -120,12 +120,12 @@ class CrudMixin:
                     async with self._transaction_or_dry_run(conn, dry_run):
                         ctx.conn = conn
                         if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
-                            # psqldb.get() already returns a plain dict (or None)
+                            # pgdb.get() already returns a plain dict (or None)
                             ctx.old = await self._psqldb.get(table, id, conn=conn)
                         ctx.doc = _precommit_doc(ctx.old, ctx.payload, is_new=False)
                         await self._run_hooks(table, "validate", ctx)
                         await self._run_hooks(table, "before_save", ctx)
-                        # psqldb.update() already returns a plain dict (or None)
+                        # pgdb.update() already returns a plain dict (or None)
                         ctx.new = await self._psqldb.update(
                             table, id, ctx.payload, updated_by=by, conn=conn
                         )
@@ -240,7 +240,7 @@ class CrudMixin:
         no-id-no-match_on).
 
         skip_hooks=True skips every hook this call would otherwise fire,
-        for a bulk/import-style caller that wants raw psqldb-speed writes
+        for a bulk/import-style caller that wants raw pgdb-speed writes
         without losing save()'s own match_on/lock/upsert conveniences.
         The individual skip_validate/skip_before_save/skip_after_save/
         skip_after_commit/skip_on_rollback flags are for the narrower
@@ -282,7 +282,7 @@ class CrudMixin:
         (two callers in two different Gateway worker processes could
         previously race past it and create a genuine duplicate row). The
         rare loser of that race now gets a friendly `ValidationError`
-        (psqldb.validation.friendly_unique_error) instead of a lock wait —
+        (pgdb.validation.friendly_unique_error) instead of a lock wait —
         not a single atomic statement (this is still select-then-branch,
         just without the lock), a deliberate, smaller-scope fix: a true
         one-statement `INSERT ... ON CONFLICT` upsert would need to decide
@@ -402,7 +402,7 @@ class CrudMixin:
                         async with self._transaction_or_dry_run(conn, dry_run):
                             ctx.conn = conn
                             if self._has_hooks(table, PRECOMMIT_EVENTS | POSTCOMMIT_EVENTS):
-                                # psqldb.get() already returns a plain dict (or None)
+                                # pgdb.get() already returns a plain dict (or None)
                                 ctx.old = await self._psqldb.get(table, id, conn=conn)
                             ctx.doc = _delete_doc(ctx.old)
                             await self._run_hooks(table, "before_delete", ctx)
@@ -442,7 +442,7 @@ class CrudMixin:
                             table, [ctx.payload for ctx in ctxs], created_by=by, conn=conn
                         )
                         for ctx, row in zip(ctxs, results):
-                            ctx.new = row  # psqldb.insert_many() already returns plain dicts
+                            ctx.new = row  # pgdb.insert_many() already returns plain dicts
                             ctx.doc = _postwrite_doc(ctx.new, None, is_new=True)
                         for ctx in ctxs:
                             await self._run_hooks(table, "after_save", ctx)
@@ -482,7 +482,7 @@ class CrudMixin:
                     async with self._transaction_or_dry_run(conn, dry_run):
                         if need_old:
                             old_rows = await self._psqldb.get_many(table, ids, conn=conn)
-                            # psqldb.get_many() already returns plain dicts
+                            # pgdb.get_many() already returns plain dicts
                             old_by_id = {r["id"]: r for r in old_rows}
                             for ctx, row_id in zip(ctxs, ids):
                                 ctx.old = old_by_id.get(row_id)
@@ -498,7 +498,7 @@ class CrudMixin:
                             updated_by=by,
                             conn=conn,
                         )
-                        # psqldb.update_many() already returns plain dicts
+                        # pgdb.update_many() already returns plain dicts
                         results_by_id = {r["id"]: r for r in results}
                         for ctx, row_id in zip(ctxs, ids):
                             ctx.new = results_by_id.get(row_id)
@@ -741,7 +741,7 @@ class CrudMixin:
                                 old_rows = await self._psqldb.get_many(
                                     table, [rid for rid, _ in update_targets], conn=conn
                                 )
-                                # psqldb.get_many() already returns plain dicts
+                                # pgdb.get_many() already returns plain dicts
                                 old_by_id = {r["id"]: r for r in old_rows}
                                 for ctx, (rid, _data) in zip(update_ctxs, update_targets):
                                     ctx.old = old_by_id.get(rid)
@@ -761,7 +761,7 @@ class CrudMixin:
                                     created_by=by,
                                     conn=conn,
                                 )
-                                # psqldb.insert_many() already returns plain dicts
+                                # pgdb.insert_many() already returns plain dicts
                                 for c, r in zip(insert_ctxs, results):
                                     c.new = r
                                     c.doc = _postwrite_doc(c.new, None, is_new=True)
@@ -775,7 +775,7 @@ class CrudMixin:
                                     updated_by=by,
                                     conn=conn,
                                 )
-                                # psqldb.update_many() already returns plain dicts
+                                # pgdb.update_many() already returns plain dicts
                                 results_by_id = {r["id"]: r for r in results}
                                 for (rid, _d), c in zip(update_targets, update_ctxs):
                                     c.new = results_by_id.get(rid)
@@ -835,7 +835,7 @@ class CrudMixin:
                         async with self._transaction_or_dry_run(conn, dry_run):
                             if need_old:
                                 old_rows = await self._psqldb.get_many(table, ids, conn=conn)
-                                # psqldb.get_many() already returns plain dicts
+                                # pgdb.get_many() already returns plain dicts
                                 old_by_id = {r["id"]: r for r in old_rows}
                                 for ctx, row_id in zip(ctxs, ids):
                                     ctx.old = old_by_id.get(row_id)
