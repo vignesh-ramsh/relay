@@ -158,7 +158,7 @@ class RelayProvider(
         list_max_limit: int = MAX_LIST_LIMIT,
     ) -> None:
         self._kernel = kernel
-        self._psqldb = kernel.get("psqldb")
+        self._psqldb = kernel.get("pgdb")
         self._redix = kernel.get("redix") if kernel.has("redix") else None
         self._list_default_limit = list_default_limit
         self._list_max_limit = list_max_limit
@@ -436,12 +436,12 @@ def register(kernel: Any) -> None:
     # processes, for everything IT runs. relay owns the schema since it's
     # the common denominator: every project using lineup also has relay,
     # not the reverse.
-    kernel.get("psqldb").register_model(Path(__file__).parent.parent / "schemas")
+    kernel.get("pgdb").register_model(Path(__file__).parent.parent / "schemas")
 
     kernel.export(
         CAPABILITY,
         provider,
-        requires=["psqldb"],
+        requires=["pgdb"],
         optional_requires=["authn", "redix", "gateway", "lineup"],
     )
 

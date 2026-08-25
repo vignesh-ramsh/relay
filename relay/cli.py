@@ -48,11 +48,11 @@ def prune_job_log_cmd(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", arc.ArcAdvisory)
             arc.boot()
-        await arc.psqldb.open()
+        await arc.pgdb.open()
         try:
             return await prune_job_log(older_than_days)
         finally:
-            await arc.psqldb.close()
+            await arc.pgdb.close()
 
     deleted = asyncio.run(_run())
     console.print(f"[bold green]Deleted {deleted} row(s)[/bold green] from _job_log.")

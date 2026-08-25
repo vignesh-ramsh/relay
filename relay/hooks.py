@@ -27,7 +27,7 @@ class HooksMixin:
     _loading_plugin: str | None
 
     def register_hooks(self, hooks_dir: str | Path) -> None:
-        from psqldb.model import (
+        from pgdb.model import (
             slugify_table_name,
         )  # only dependency Relay takes on psqldb's internals
 

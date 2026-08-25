@@ -494,7 +494,7 @@ class BackgroundJobsMixin:
                 # mask or replace the real task's own outcome above.
                 finished_at = arc.tz.utcnow()
                 try:
-                    await arc.psqldb.insert(
+                    await arc.pgdb.insert(
                         "_job_log",
                         {
                             "task_name": getattr(fn, "__qualname__", None)
@@ -570,7 +570,7 @@ class BackgroundJobsMixin:
             # Postgres default-generate it — so the row's real id comes
             # back from the INSERT's own RETURNING *, not from anything
             # chosen up front.
-            inserted = await arc.psqldb.insert(
+            inserted = await arc.pgdb.insert(
                 "_job_log",
                 {
                     "task_name": f"{payload['module']}.{payload['qualname']}",
@@ -614,7 +614,7 @@ class BackgroundJobsMixin:
         started_at = arc.tz.utcnow()
         lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         claim_token = uuid.uuid4().hex
-        async with arc.psqldb.acquire() as conn:
+        async with arc.pgdb.acquire() as conn:
             return await conn.fetchrow(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
                 'started_at=$4, claim_token=$5 WHERE id=$6 AND status=$7 RETURNING *',
@@ -652,7 +652,7 @@ class BackgroundJobsMixin:
                 await asyncio.sleep(_LEASE_RENEW_INTERVAL_SECONDS)
                 lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS)
                 try:
-                    async with arc.psqldb.acquire() as conn:
+                    async with arc.pgdb.acquire() as conn:
                         renewed = await conn.fetchval(
                             'UPDATE "_job_log" SET lease_expires_at=$1 '
                             "WHERE id=$2 AND claim_token=$3 RETURNING id",
@@ -736,7 +736,7 @@ class BackgroundJobsMixin:
                 await heartbeat
             finished_at = arc.tz.utcnow()
             try:
-                async with arc.psqldb.acquire() as conn:
+                async with arc.pgdb.acquire() as conn:
                     updated = await conn.fetchval(
                         'UPDATE "_job_log" SET status=$1, error=$2, finished_at=$3, '
                         "duration_ms=$4 WHERE id=$5 AND claim_token=$6 RETURNING id",
@@ -793,7 +793,7 @@ class BackgroundJobsMixin:
         started_at = arc.tz.utcnow()
         lease_until = arc.tz.add(seconds=_JOB_LEASE_SECONDS, base=started_at)
         claim_token = uuid.uuid4().hex
-        async with arc.psqldb.acquire() as conn:
+        async with arc.pgdb.acquire() as conn:
             claimed = await conn.fetch(
                 'UPDATE "_job_log" SET status=$1, claimed_by=$2, lease_expires_at=$3, '
                 "started_at=COALESCE(started_at, $4), claim_token=$5 "

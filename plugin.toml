@@ -2,5 +2,5 @@
 name = "relay"
 version = "0.1.0"
 capability = "relay"
-requires = ["psqldb"]
+requires = ["pgdb"]
 optional_requires = ["authn", "redix", "gateway", "lineup"]

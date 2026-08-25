@@ -3,7 +3,7 @@ relay.query
 -------------------
 The bounded Query Engine (Architecture §3.4) — filters, ordering, pagination,
 single-hop relation resolution, and aggregates. Lives in Relay, not psqldb
-(psqldb only ever executes SQL — arc.psqldb.fetch/fetch_one/fetch_val/execute
+(psqldb only ever executes SQL — arc.pgdb.fetch/fetch_one/fetch_val/execute
 — and holds the schema registry every table's shape is read from; Relay is
 where the vocabulary of "what a filter/field/order_by means" is decided and
 turned into one parameterized SQL string).
@@ -44,8 +44,8 @@ from typing import Any, Callable
 # same exception §3.2 already carves out for register_hooks()'s
 # slugify_table_name import: type hints only, not a second query-building
 # implementation duplicating psqldb's own field/schema knowledge.
-from psqldb.fields import Field
-from psqldb.model import TableSchema
+from pgdb.fields import Field
+from pgdb.model import TableSchema
 
 from .resolvers import FieldResolver
 
@@ -91,7 +91,7 @@ _ALL_OPS = (
 _AGG_FNS = frozenset({"count", "sum", "avg", "min", "max"})
 
 # psqldb.migrate.ddl.RefColumn's shape, duck-typed here (table/column/sql_type
-# attributes) rather than imported — RelayProvider passes arc.psqldb.ref_columns()
+# attributes) rather than imported — RelayProvider passes arc.pgdb.ref_columns()
 # straight through; this module never constructs one itself.
 RefColumns = dict[tuple[str, str], Any]
 SchemaLookup = Callable[[str], TableSchema]
