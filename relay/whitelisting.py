@@ -47,6 +47,24 @@ from .shapes import CallContext, RelayError, RelayStream, WhitelistedFunction
 # fallback on any endpoint that hasn't deliberately restricted `methods`.
 ALL_METHODS = ("GET", "QUERY", "POST", "PUT", "PATCH", "DELETE")
 
+#: Which verbs conditional-GET/ETag semantics apply to — same set
+#: dry_run_signal (below, computed per-request from request.method) uses
+#: for the identical "safe and idempotent" reasoning, kept as its own
+#: constant here since it's evaluated once per (method, path)
+#: REGISTRATION rather than once per request.
+_ETAG_ELIGIBLE_METHODS = frozenset({"GET", "QUERY"})
+
+
+def _resolve_etag(etag: bool | None, method: str) -> bool:
+    """whitelist()'s own `etag` kwarg, resolved for one specific method
+    registration — see that kwarg's own docstring. Always False outside
+    _ETAG_ELIGIBLE_METHODS, regardless of what was asked for: conditional-
+    GET semantics don't apply to a mutating verb, so there is no opt-IN
+    for one, only the opt-OUT this function already gives GET/QUERY."""
+    if method not in _ETAG_ELIGIBLE_METHODS:
+        return False
+    return True if etag is None else etag
+
 # Injected by _wire_gateway_route itself (identity/client_ip/cookies/
 # headers/request/dry_run/request_id) — never sourced from the caller's
 # own query/body/path, so these names are never candidates for the
@@ -230,6 +248,7 @@ class WhitelistingMixin:
         roles: list[str] | None = None,
         path: str | None = None,
         max_body_bytes: int | None = None,
+        etag: bool | None = None,
     ) -> Callable[[Callable], Callable]:
         """`methods`/`roles` are RESTRICTIONS, applied only when given —
         never a required allowlist a caller must fill in just to get a
@@ -257,6 +276,20 @@ class WhitelistingMixin:
         own RouteEntry.max_body_bytes docstring has the full reasoning).
         Fixed at decoration time, same as gateway_max_body_bytes itself is
         fixed at boot — not a live-editable setting.
+
+        `etag` (2026-08-27): conditional-GET support (strong ETag, hashed
+        via arc.hash() over the exact response body; a matching
+        `If-None-Match` gets a bodyless 304 back instead of the full 200)
+        for this function's GET/QUERY registration(s) — a pure bandwidth
+        optimization, no caching policy of its own (see
+        gateway.GatewayProvider.add_route's own docstring for the full
+        reasoning). `None` (the default) means True for GET/QUERY, and is
+        simply never eligible for any other method — pass `etag=False` to
+        opt a specific GET/QUERY-serving function out entirely (e.g. one
+        whose response legitimately differs on every call in a way that
+        would make every request pay the hashing cost for zero 304s in
+        return, however cheap that cost normally is). `etag=True` is a
+        no-op for a function with no GET/QUERY in `methods` at all.
         """
         roles = roles if roles is not None else ["*"]
         methods = methods if methods is not None else list(ALL_METHODS)
@@ -318,6 +351,7 @@ class WhitelistingMixin:
                 wants_dry_run="dry_run" in sig.parameters,
                 signature=sig,
                 max_body_bytes=max_body_bytes,
+                etag=etag,
                 param_types=param_types,
                 payload_type=payload_type,
                 payload_param=payload_param,
@@ -687,4 +721,5 @@ class WhitelistingMixin:
                 handler,
                 summary=f"whitelisted: {wf.name}",
                 max_body_bytes=wf.max_body_bytes,
+                etag=_resolve_etag(wf.etag, method),
             )

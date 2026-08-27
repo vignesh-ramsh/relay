@@ -272,6 +272,12 @@ class WhitelistedFunction:
     # than recomputing inspect.signature(fn) per request
     max_body_bytes: int | None = None  # None -> gateway's own shared ceiling;
     # passed straight through to gateway.add_route()
+    etag: bool | None = None  # None (the default) -> resolved per registered
+    # method by _resolve_etag below: True for a GET/QUERY route, False for
+    # anything else — conditional-GET semantics apply only to safe,
+    # idempotent verbs. An explicit True/False here always wins for
+    # GET/QUERY (the caller's own opt-out); it's a no-op for any other
+    # method, which is never etag-eligible regardless of what's asked for.
     param_types: dict[str, Any] = field(default_factory=dict)
     # name -> annotation, for every plain parameter whitelist() recognized as
     # coercible (int/float/bool/str/UUID/date/datetime/time, or one of those
