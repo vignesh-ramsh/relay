@@ -241,6 +241,12 @@ class RelayProvider(
             labels[_CTX_LABEL_USER] = ctx.user
         if ctx.roles:
             labels[_CTX_LABEL_ROLES] = arc.codec.encode(list(ctx.roles)).decode()
+        # Trace continuation is a separate concern from CallContext (arc.
+        # tracing owns its own wire format, same "relay just delegates,
+        # doesn't need to know what's inside" posture as everything else
+        # in this method) — {} whenever tracing is off, same as an empty
+        # CallContext, so a caller can still skip labelling entirely.
+        labels.update(arc.tracing.current_trace_labels())
         return labels
 
     @contextlib.contextmanager
@@ -281,7 +287,15 @@ class RelayProvider(
         )
         token = _call_context.set(ctx)
         try:
-            yield ctx
+            # Same delegation as context_labels()'s own write side — a
+            # clean no-op when tracing is off, or `labels` carries no
+            # trace_id at all (a job enqueued before this existed, or a
+            # CLI-triggered one, which never has an active span to begin
+            # with). When it DOES apply, the job's own span becomes a
+            # child of the request that enqueued it, even though it's
+            # running later, in a different process.
+            with arc.tracing.continue_trace(labels):
+                yield ctx
         finally:
             _call_context.reset(token)
 

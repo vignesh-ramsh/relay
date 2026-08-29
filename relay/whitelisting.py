@@ -15,6 +15,7 @@ one of several mixins RelayProvider (relay/__init__.py) inherits from;
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import inspect
 import sys
@@ -641,10 +642,24 @@ class WhitelistingMixin:
                 user=getattr(identity, "email", None),
                 roles=tuple(sorted(caller_roles)),
             )
+            # Span covers exactly this HTTP-triggered invocation of wf.fn —
+            # the direct/CLI/queued-task path (call(), below) deliberately
+            # does NOT get one this pass, per arc.tracing's own "CLI
+            # processes never call start_exporter()" scoping; get_tracer()
+            # is None there anyway, so this would no-op regardless.
+            _tracer = arc.tracing.get_tracer()
+            _span_cm = (
+                _tracer.start_as_current_span(
+                    "arc.relay.call", attributes={"arc.plugin": wf.plugin, "arc.relay.function": wf.name}
+                )
+                if _tracer is not None
+                else contextlib.nullcontext()
+            )
             token = _dry_run.set(dry_run_signal)
             ctx_token = _call_context.set(call_ctx)
             try:
-                result = await wf.fn(**kwargs)
+                with _span_cm:
+                    result = await wf.fn(**kwargs)
             except RelayError as exc:
                 body = {**(exc.extra or {}), "error": exc.message, "code": exc.code}
                 raise HTTPError(exc.status, body) from exc
