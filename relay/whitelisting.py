@@ -154,6 +154,64 @@ def _inspect_whitelisted_signature(
     return param_types, payload_type, payload_param
 
 
+def _type_label(py_type: Any) -> str:
+    """A short, human-readable type name for the /openapi UI's request-
+    schema listing — "str", "int | None" stays just "str"/"int" (the
+    Optional-unwrap whitelist() itself already does for coercion purposes,
+    see _coercible_type), never a raw typing internals repr."""
+    origin = typing.get_origin(py_type)
+    if origin is typing.Union:
+        args = [a for a in typing.get_args(py_type) if a is not type(None)]
+        if args:
+            return _type_label(args[0])
+    return getattr(py_type, "__name__", str(py_type))
+
+
+def _request_schema_for(wf: "WhitelistedFunction") -> Any:
+    """A best-effort, JSON-serializable description of this function's
+    request payload, for the /openapi UI's per-method "Request" tab —
+    NOT used for validation (param_types/_coerce_kwargs already do that,
+    completely unaffected by this). A typed-payload function
+    (wf.payload_type) hands back the real arc.codec.Struct type itself —
+    gateway.openapi._schema_for() derives its actual field schema the
+    same way it already does for any other Struct type. A plain-kwargs
+    function has no single type to point at, so this hand-builds an
+    object schema from param_types (every parameter whitelist() actually
+    recognizes and coerces) instead — an untyped/unrecognized parameter
+    (dict/list/Any) is invisible to param_types and so absent here too,
+    same as it always was for coercion."""
+    if wf.payload_type is not None:
+        return wf.payload_type
+    if not wf.param_types:
+        return None
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for name, ptype in wf.param_types.items():
+        properties[name] = {"type": _type_label(ptype)}
+        param = wf.signature.parameters.get(name) if wf.signature is not None else None
+        if param is not None and param.default is inspect.Parameter.empty:
+            required.append(name)
+    schema: dict[str, Any] = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _response_schema_for(wf: "WhitelistedFunction") -> Any:
+    """The function's own return-type annotation, if it has one — handed
+    to gateway.openapi._schema_for() the same way payload_type is above.
+    Harmlessly becomes None there for anything that isn't a real
+    arc.codec.Struct (a plain str/dict/list/int return type, or no
+    annotation at all) — this never claims more than the function's own
+    signature actually states."""
+    if wf.signature is None:
+        return None
+    ret = wf.signature.return_annotation
+    if ret is inspect.Signature.empty or ret is None:
+        return None
+    return ret
+
+
 def _attach_server_timezone_if_naive(value: Any) -> Any:
     """A `datetime` decoded with no explicit UTC offset in its source text
     (e.g. "2026-10-10T14:30:00", vs. "...+05:30" or "...Z") comes back from
@@ -737,4 +795,16 @@ class WhitelistingMixin:
                 summary=f"whitelisted: {wf.name}",
                 max_body_bytes=wf.max_body_bytes,
                 etag=_resolve_etag(wf.etag, method),
+                plugin=wf.plugin,
+                # Not enforcement — an ordinary HTTP route's real auth check
+                # still happens inside `handler` above via caller_roles, same
+                # as always. This is documentation-only: RouteEntry.roles
+                # was previously WS-only (gateway's WS handshake DOES read
+                # it for real enforcement there); nothing in the HTTP
+                # dispatch path reads it, so populating it here is safe and
+                # is what lets the /openapi UI show "allowed roles" per
+                # route without relay needing a second, parallel channel.
+                roles=frozenset(wf.roles) if wf.roles else None,
+                request_schema=_request_schema_for(wf),
+                response_schema=_response_schema_for(wf),
             )
