@@ -806,5 +806,21 @@ class WhitelistingMixin:
                 # route without relay needing a second, parallel channel.
                 roles=frozenset(wf.roles) if wf.roles else None,
                 request_schema=_request_schema_for(wf),
+                # False: `handler` above already does its own, complete
+                # validation (_coerce_kwargs/_build_payload — query string +
+                # body + path params merged, correct 400 on a bad value,
+                # works for a bodyless GET) before wf.fn is ever called.
+                # request_schema here exists purely for the /openapi docs
+                # page (_request_schema_for's own docstring) — for a plain-
+                # kwargs function it's a hand-built object schema, never a
+                # real msgspec-decodable type, so leaving gateway's own
+                # default (validate_body=True) would have it try to decode
+                # the raw body against that schema BEFORE handler even
+                # runs, which fails unconditionally (empty body on a GET;
+                # not a real type either way) — verified directly this
+                # turned every whitelisted function with any declared
+                # parameter into a permanent 422 regardless of what the
+                # caller sent.
+                validate_body=False,
                 response_schema=_response_schema_for(wf),
             )
