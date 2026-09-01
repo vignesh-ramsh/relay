@@ -308,6 +308,7 @@ class WhitelistingMixin:
         path: str | None = None,
         max_body_bytes: int | None = None,
         etag: bool | None = None,
+        trace: bool | None = None,
     ) -> Callable[[Callable], Callable]:
         """`methods`/`roles` are RESTRICTIONS, applied only when given —
         never a required allowlist a caller must fill in just to get a
@@ -349,6 +350,16 @@ class WhitelistingMixin:
         would make every request pay the hashing cost for zero 304s in
         return, however cheap that cost normally is). `etag=True` is a
         no-op for a function with no GET/QUERY in `methods` at all.
+
+        `trace` (2026-09-01): whether this function's route(s) get an
+        OpenTelemetry root span at all. `None` (the default) means True —
+        traced like everything else. Pass `trace=False` for an endpoint
+        whose spans are pure noise in a real trace backend — a health
+        check, a metrics scrape, anything hit constantly and uniformly
+        uninteresting — without touching the GLOBAL tracing_otlp_endpoint/
+        tracing_sample_rate_percent settings (arc.tracing.declare), which
+        still decide whether tracing happens at all/at what rate for every
+        OTHER whitelisted function regardless of this one's own value.
         """
         roles = roles if roles is not None else ["*"]
         methods = methods if methods is not None else list(ALL_METHODS)
@@ -411,6 +422,7 @@ class WhitelistingMixin:
                 signature=sig,
                 max_body_bytes=max_body_bytes,
                 etag=etag,
+                trace=trace,
                 param_types=param_types,
                 payload_type=payload_type,
                 payload_param=payload_param,
@@ -705,7 +717,21 @@ class WhitelistingMixin:
             # does NOT get one this pass, per arc.tracing's own "CLI
             # processes never call start_exporter()" scoping; get_tracer()
             # is None there anyway, so this would no-op regardless.
-            _tracer = arc.tracing.get_tracer()
+            #
+            # wf.trace=False also gates THIS span, not just gateway's own
+            # HTTP root span (_wire_gateway_route's own add_route call,
+            # trace=True if wf.trace is None else wf.trace) — verified
+            # directly that skipping only the root span was NOT enough:
+            # this "arc.relay.call" span starts independently, so a caller
+            # inside wf.fn would still see get_current_span().is_recording()
+            # True even with the root span correctly suppressed. Both are
+            # real, separate instrumentation points (this module's own
+            # docstring already lists them as such — "gateway's
+            # tracing_middleware, relay's call wrap, pgdb's query hook" —
+            # each checks get_tracer() independently); an endpoint that
+            # opts out needs neither to fire.
+            _wants_trace = True if wf.trace is None else wf.trace
+            _tracer = arc.tracing.get_tracer() if _wants_trace else None
             _span_cm = (
                 _tracer.start_as_current_span(
                     "arc.relay.call", attributes={"arc.plugin": wf.plugin, "arc.relay.function": wf.name}
@@ -822,5 +848,13 @@ class WhitelistingMixin:
                 # parameter into a permanent 422 regardless of what the
                 # caller sent.
                 validate_body=False,
+                # wf.trace=None (whitelist()'s own default) -> True: traced
+                # like every other route, unchanged from before this
+                # existed. An explicit False here is the whole feature —
+                # gateway.add_route's own docstring / RouteEntry.trace's
+                # own docstring have the mechanism (a second route lookup
+                # inside tracing_middleware itself, since it runs before
+                # _dispatch's routing).
+                trace=True if wf.trace is None else wf.trace,
                 response_schema=_response_schema_for(wf),
             )

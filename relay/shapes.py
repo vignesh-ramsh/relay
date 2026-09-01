@@ -278,6 +278,16 @@ class WhitelistedFunction:
     # idempotent verbs. An explicit True/False here always wins for
     # GET/QUERY (the caller's own opt-out); it's a no-op for any other
     # method, which is never etag-eligible regardless of what's asked for.
+    trace: bool | None = None  # None (the default) -> True — every route traced,
+    # same as before this existed. Pass trace=False to whitelist() for an
+    # endpoint whose spans are pure noise in a real trace backend (a health
+    # check, a metrics scrape) — passed straight through to
+    # gateway.add_route(), which is where it's actually enforced (a second,
+    # early route lookup inside tracing_middleware itself — see
+    # RouteEntry.trace's own docstring for why it has to be there rather
+    # than checked here). Entirely independent of the global
+    # tracing_otlp_endpoint/tracing_sample_rate_percent settings, which
+    # still govern every other route regardless of this one's own value.
     param_types: dict[str, Any] = field(default_factory=dict)
     # name -> annotation, for every plain parameter whitelist() recognized as
     # coercible (int/float/bool/str/UUID/date/datetime/time, or one of those
