@@ -280,6 +280,28 @@ class BackgroundJobsMixin:
 
         return decorator
 
+    def declare_queue(self, queue: str) -> None:
+        """Announces that this plugin sends work to `queue` via ad hoc
+        `arc.relay.enqueue(fn, queue="...")` calls, so a worker process
+        listens on it without an operator having to know to ask.
+
+        Call it from `register()`. Needed because a worker only ever learns
+        about the queues that exist after ITS OWN boot, and boot only
+        creates a queue for a task pre-declared with `@arc.relay.task(
+        queue=...)`. A queue reached solely through ad hoc `enqueue(fn,
+        queue="mail")` calls — mail's own — never exists in a freshly
+        booted worker, so nothing consumes it: jobs pile up in Redis and
+        no error is ever raised. (That is exactly how outgoing email used to
+        be silently dropped on any install that hadn't set `lineup_queues`.)
+
+        With no `lineup` installed there is nothing to declare against —
+        `enqueue()`'s in-process fallbacks have no named queues at all
+        (`queue=` "has no meaning" there, per its own docstring) — so this
+        is a no-op, which is also what keeps a plugin able to call it
+        unconditionally without a hard dependency on lineup."""
+        if self._kernel.has("lineup"):
+            self._kernel.get("lineup").ensure_queue(queue)
+
     def enqueue(
         self, fn: Callable[..., Awaitable[Any]], *args: Any, queue: str = "default", **kwargs: Any
     ) -> asyncio.Task:
