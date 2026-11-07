@@ -604,6 +604,8 @@ class WhitelistingMixin:
                 # 422 every such call before it ever reached its handler,
                 # since a multipart/form-data body is never valid JSON.
                 body = request.json() if request.body and not wf.wants_request else {}
+            except HTTPError:
+                raise  # e.g. 413 for a body over the JSON ceiling: not a malformed body
             except Exception as exc:
                 raise HTTPError(422, {"error": "invalid JSON body", "detail": str(exc)}) from exc
             # A JSON body that decodes to a list/string/number/etc. isn't
