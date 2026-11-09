@@ -48,6 +48,7 @@ import arc  # safe at module level — same pattern gateway/request.py already u
 
 # arc.codec is stateless and needs no active kernel to be imported
 from . import query
+from ._maintenance import DEFAULT_RETENTION_DAYS as _JOB_LOG_RETENTION_DEFAULT_DAYS
 from .ambient import (
     _CTX_LABEL_REQUEST_ID,
     _CTX_LABEL_ROLES,
@@ -398,7 +399,13 @@ def register(kernel: Any) -> None:
     # The one knob governing _job_log retention (_maintenance.prune_job_log)
     # — declared here so it's discoverable via arc.settings.list_all() and
     # admin's Settings page (§3.5: declare once, by the owning plugin).
-    kernel.settings.declare("job_log_retention_days")
+    kernel.settings.declare(
+        "job_log_retention_days",
+        type=int,
+        default=_JOB_LOG_RETENTION_DEFAULT_DAYS,
+        doc="How many days ARC keeps the history of finished background jobs before deleting it. If not set, 60 "
+        "days.",
+    )
 
     # list()/list_page()'s row cap — see the module-level constants' own
     # docstring for the full split between "default" and "max". Plain
@@ -408,18 +415,15 @@ def register(kernel: Any) -> None:
         RELAY_LIST_DEFAULT_LIMIT_KEY,
         type=int,
         default=DEFAULT_LIST_LIMIT,
-        doc="Row cap for arc.relay.list()/list_page() when the caller doesn't pass "
-        "`limit` at all. Pass limit=None on a specific call for a genuinely "
-        "unbounded read.",
+        doc="How many rows a list read returns when the caller does not ask for a number (default 20). A caller "
+        "can pass `limit=None` to read without a limit.",
     )
     kernel.settings.declare(
         RELAY_LIST_MAX_LIMIT_KEY,
         type=int,
         default=MAX_LIST_LIMIT,
-        doc="Hard ceiling on any explicit `limit` passed to arc.relay.list()/"
-        "list_page() — a caller asking for more gets a clear QueryError, never a "
-        "silent truncation. Pass limit=None (never a large number) for an "
-        "intentionally unbounded read.",
+        doc="The biggest number of rows any list read may ask for (default 1000). Asking for more is refused with "
+        "a clear error, never silently cut short.",
     )
     list_default_limit = kernel.settings.get(RELAY_LIST_DEFAULT_LIMIT_KEY)
     list_max_limit = kernel.settings.get(RELAY_LIST_MAX_LIMIT_KEY)
