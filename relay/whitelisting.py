@@ -277,6 +277,15 @@ def _build_payload(wf: "WhitelistedFunction", kwargs: dict[str, Any]) -> Any:
     return msgspec.structs.replace(payload, **updates) if updates else payload
 
 
+def _accepts_authorize(add_route: Any) -> bool:
+    """Whether the installed gateway's add_route takes an `authorize` hook. One that predates it does not,
+    and passing it anyway would stop every route from registering."""
+    try:
+        return "authorize" in inspect.signature(add_route).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class WhitelistingMixin:
     # Set by RelayProvider.__init__ — see relay/__init__.py for the full
     # reasoning behind each of these.
@@ -550,21 +559,13 @@ class WhitelistingMixin:
             StreamResponse,
         )  # only imported when gateway is actually present
 
-        async def handler(request: Any) -> Any:
-            # request.identity is None whenever authn isn't installed, or a
-            # request carries no valid credentials — both collapse to
-            # caller_roles = {"Guest"}, identical to this cut's old
-            # Guest-only behavior, so roles=["Guest"] endpoints (e.g.
-            # example_hr's) are unaffected either way. "*" now means EITHER
-            # an explicit roles=["*"] OR the (new) implicit default —
-            # authn absent makes identity always None either way, so this
-            # branch already resolves to `authorized = False` for both
-            # cases with zero special-casing (see whitelist()'s own
-            # docstring — this is what makes the boot-time error safe to
-            # remove: the request-time 403 below was ALREADY correct).
+        def authorize(request: Any) -> None:
+            """Raise HTTPError 403 unless this request's caller may call `wf`. Only the identity is read, never the body,
+            so the gateway can run it before it reads a large upload into memory (see gateway.add_route's
+            `authorize`): a caller who would be refused is refused first. The handler runs it again - this one
+            is early, not instead."""
             identity = getattr(request, "identity", None)
             caller_roles = set(getattr(identity, "roles", None) or [])
-            request_id = getattr(request, "request_id", None)
             if "*" in wf.roles:
                 authorized = identity is not None
             elif "*" in caller_roles:
@@ -596,6 +597,23 @@ class WhitelistingMixin:
                 raise HTTPError(
                     403, {"error": "forbidden", "detail": f"requires role(s) {wf.roles}"}
                 )
+
+        async def handler(request: Any) -> Any:
+            # request.identity is None whenever authn isn't installed, or a
+            # request carries no valid credentials — both collapse to
+            # caller_roles = {"Guest"}, identical to this cut's old
+            # Guest-only behavior, so roles=["Guest"] endpoints (e.g.
+            # example_hr's) are unaffected either way. "*" now means EITHER
+            # an explicit roles=["*"] OR the (new) implicit default —
+            # authn absent makes identity always None either way, so this
+            # branch already resolves to `authorized = False` for both
+            # cases with zero special-casing (see whitelist()'s own
+            # docstring — this is what makes the boot-time error safe to
+            # remove: the request-time 403 below was ALREADY correct).
+            identity = getattr(request, "identity", None)
+            caller_roles = set(getattr(identity, "roles", None) or [])
+            request_id = getattr(request, "request_id", None)
+            authorize(request)
             try:
                 # wants_request functions get the raw Request instead (see
                 # WhitelistedFunction's own docstring) and parse their own
@@ -833,6 +851,9 @@ class WhitelistingMixin:
                 # is what lets the /openapi UI show "allowed roles" per
                 # route without relay needing a second, parallel channel.
                 roles=frozenset(wf.roles) if wf.roles else None,
+                # The same check, for the gateway to run before it reads a big body (a gateway that
+                # predates the hook just does not get it).
+                **({"authorize": authorize} if _accepts_authorize(gateway.add_route) else {}),
                 request_schema=_request_schema_for(wf),
                 # False: `handler` above already does its own, complete
                 # validation (_coerce_kwargs/_build_payload — query string +
