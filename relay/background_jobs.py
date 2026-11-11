@@ -302,6 +302,17 @@ class BackgroundJobsMixin:
         if self._kernel.has("lineup"):
             self._kernel.get("lineup").ensure_queue(queue)
 
+    def in_write_transaction(self) -> bool:
+        """True while the caller is inside a write that has not committed
+        yet (a validate / before_save / after_save hook, or code a hook
+        called). A job enqueued now is released only when that write ends,
+        so waiting for the Task `enqueue()` returned would wait on yourself:
+        helpers that wrap `enqueue()` use this to skip the wait. False in an
+        API handler, a CLI, a job, and in `after_commit` / `on_rollback`
+        hooks (the write is over by then, so a wait cannot deadlock)."""
+        waiters = _postcommit_waiters.get()
+        return waiters is not None and not waiters.resolved
+
     def enqueue(
         self, fn: Callable[..., Awaitable[Any]], *args: Any, queue: str = "default", **kwargs: Any
     ) -> asyncio.Task:
@@ -397,11 +408,25 @@ class BackgroundJobsMixin:
         and transactions.py's _postcommit_scope. Called with no active
         write in progress (the overwhelmingly common case — an API handler,
         a CLI, a background job itself), there is nothing to wait for and
-        dispatch starts immediately, exactly as before."""
+        dispatch starts immediately, exactly as before. The same holds from a
+        table's own `after_commit` / `on_rollback` hook: the write has ended
+        by then, so a job enqueued there is dispatched at once — that is the
+        way to run follow-up work once the data is durable.
+
+        Do NOT `await` the returned Task from inside a write (before_save,
+        after_save, validate ...): it only finishes once the write commits,
+        and the write cannot commit while its own hook waits on it, so the
+        request hangs. Drop the Task there (the job is tracked and its
+        failures are logged), and use `in_write_transaction()` in a helper
+        that would otherwise wait for it (`arc.mail.send` does)."""
         waiters = _postcommit_waiters.get()
 
         def _await_gate() -> "asyncio.Future | None":
-            if waiters is None:
+            # No write in progress, or the write has already ended (this call
+            # came from its own after_commit / on_rollback hook): nothing to
+            # wait for, dispatch now. A gate created after the write resolved
+            # would never be woken, and the job would silently never run.
+            if waiters is None or waiters.resolved:
                 return None
             fut = asyncio.get_running_loop().create_future()
             waiters.append(fut)

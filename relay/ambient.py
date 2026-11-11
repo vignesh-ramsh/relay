@@ -103,7 +103,22 @@ _postcommit_queue: ContextVar[list | None] = ContextVar(
 # become eligible to run at essentially the same moment, not one blocking
 # the other. None (the default) means "no active write" — enqueue() reads
 # that as "dispatch immediately," its original, unchanged behavior.
-_postcommit_waiters: ContextVar[list | None] = ContextVar(
+#
+# The list also remembers that it has been resolved. The outermost write's
+# own after_commit/on_rollback hooks run AFTER the futures were resolved but
+# still inside the write's scope (so they still see this list): an enqueue()
+# made from one of those hooks would otherwise register a future nothing
+# will ever resolve, and the job would silently never be dispatched. Once
+# `resolved`, the transaction is over, so enqueue() has nothing to wait for
+# and dispatches immediately.
+class PostcommitWaiters(list):
+    """Futures of the enqueue() calls made inside one outermost write.
+    `resolved` flips to True the moment that write's fate is known."""
+
+    resolved: bool = False
+
+
+_postcommit_waiters: ContextVar[PostcommitWaiters | None] = ContextVar(
     "arc_relay_postcommit_waiters", default=None
 )
 

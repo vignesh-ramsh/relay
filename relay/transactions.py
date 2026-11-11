@@ -22,6 +22,7 @@ from typing import Any
 
 from .ambient import (
     _MAX_WRITE_DEPTH,
+    PostcommitWaiters,
     _active_conn,
     _postcommit_queue,
     _postcommit_waiters,
@@ -107,7 +108,7 @@ class TransactionsMixin:
         connection and is therefore its own real transaction."""
         outermost = new_transaction or _active_conn.get() is None
         token = _postcommit_queue.set([]) if outermost else None
-        waiters_token = _postcommit_waiters.set([]) if outermost else None
+        waiters_token = _postcommit_waiters.set(PostcommitWaiters()) if outermost else None
         deferred = _postcommit_queue.get()
         if deferred is None:  # defensive — only reachable if a caller nulls it mid-write
             deferred = []
@@ -150,8 +151,13 @@ class TransactionsMixin:
         awaiting it was itself cancelled before this ran — set_result would
         raise InvalidStateError in that case, harmless to skip."""
         waiters = _postcommit_waiters.get()
-        if not waiters:
+        if waiters is None:
             return
+        # Marked BEFORE waking anyone: this write's own after_commit /
+        # on_rollback hooks run next, inside this same scope, and an
+        # enqueue() they make must dispatch at once instead of waiting for a
+        # resolution that already happened.
+        waiters.resolved = True
         for fut in waiters:
             if not fut.done():
                 fut.set_result(committed)
