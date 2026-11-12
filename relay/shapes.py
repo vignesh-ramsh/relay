@@ -272,6 +272,9 @@ class WhitelistedFunction:
     # than recomputing inspect.signature(fn) per request
     max_body_bytes: int | None = None  # None -> gateway's own shared ceiling;
     # passed straight through to gateway.add_route()
+    stream_body: bool = False  # True -> gateway.add_route(stream_body=True): the body is
+    # NOT read before the function runs; `request.stream` (a BodyStream)
+    # carries it, unread. For a function that takes a big upload.
     etag: bool | None = None  # None (the default) -> resolved per registered
     # method by _resolve_etag below: True for a GET/QUERY route, False for
     # anything else — conditional-GET semantics apply only to safe,

@@ -286,6 +286,25 @@ def _accepts_authorize(add_route: Any) -> bool:
         return False
 
 
+def _gateway_streams(gateway: Any) -> bool:
+    """A streaming route on a gateway that cannot stream would be read whole by the gateway and then fail in
+    the handler (no `request.stream`): refuse to register it instead, with the reason."""
+    if _accepts_stream_body(gateway.add_route):
+        return True
+    raise RuntimeError(
+        "a whitelisted function asked for stream_body=True, but the installed gateway does not support "
+        "streamed request bodies: upgrade the gateway plugin."
+    )
+
+
+def _accepts_stream_body(add_route: Any) -> bool:
+    """Whether the installed gateway's add_route takes `stream_body`. One that predates it does not."""
+    try:
+        return "stream_body" in inspect.signature(add_route).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class WhitelistingMixin:
     # Set by RelayProvider.__init__ — see relay/__init__.py for the full
     # reasoning behind each of these.
@@ -318,6 +337,7 @@ class WhitelistingMixin:
         max_body_bytes: int | None = None,
         etag: bool | None = None,
         trace: bool | None = None,
+        stream_body: bool = False,
     ) -> Callable[[Callable], Callable]:
         """`methods`/`roles` are RESTRICTIONS, applied only when given —
         never a required allowlist a caller must fill in just to get a
@@ -369,6 +389,12 @@ class WhitelistingMixin:
         tracing_sample_rate_percent settings (arc.tracing.declare), which
         still decide whether tracing happens at all/at what rate for every
         OTHER whitelisted function regardless of this one's own value.
+
+        `stream_body`: True for a function that takes a big upload (filer's file_upload). The gateway then
+        does not read the body into memory before the function runs: the function must declare a `request`
+        parameter and reads `request.stream` (a gateway BodyStream) as the pieces arrive. The caller's roles
+        are checked before the first byte is read, and `max_body_bytes` is enforced as it streams. Needs a
+        gateway that supports it (a route cannot stream without one: registering it raises).
         """
         roles = roles if roles is not None else ["*"]
         methods = methods if methods is not None else list(ALL_METHODS)
@@ -396,6 +422,11 @@ class WhitelistingMixin:
                     f"changed to roles=['Guest'] for genuinely public access)."
                 )
             name = f"{plugin}.{fn.__name__}"
+            if stream_body and "request" not in inspect.signature(fn).parameters:
+                raise RuntimeError(
+                    f"whitelisted function '{name}' is registered with stream_body=True but has no `request` "
+                    f"parameter: it could not reach the body it asked to stream."
+                )
             derived_path = path or f"/api/v1/{name}"
             # eval_str=True: many plugins write `from __future__ import
             # annotations`, which makes every annotation a plain STRING
@@ -430,6 +461,7 @@ class WhitelistingMixin:
                 wants_dry_run="dry_run" in sig.parameters,
                 signature=sig,
                 max_body_bytes=max_body_bytes,
+                stream_body=stream_body,
                 etag=etag,
                 trace=trace,
                 param_types=param_types,
@@ -554,6 +586,7 @@ class WhitelistingMixin:
     def _wire_gateway_route(self, wf: WhitelistedFunction) -> None:
         gateway = self._kernel.get("gateway")
         from gateway.request import (
+            FileResponse,
             HTTPError,
             Response,
             StreamResponse,
@@ -808,6 +841,10 @@ class WhitelistingMixin:
                         _call_context.reset(inner_ctx_token)
 
                 return StreamResponse(source=_dry_run_scoped(result))
+            if isinstance(result, FileResponse):
+                # A file on disk for the server to send itself (gateway.request.FileResponse): a live read, not a
+                # write, and not JSON, so it goes straight to the gateway like a StreamResponse below.
+                return result
             if isinstance(result, StreamResponse):
                 # A whitelisted function that constructs its OWN
                 # gateway.request.StreamResponse directly (not via
@@ -840,6 +877,7 @@ class WhitelistingMixin:
                 handler,
                 summary=f"whitelisted: {wf.name}",
                 max_body_bytes=wf.max_body_bytes,
+                **({"stream_body": True} if wf.stream_body and _gateway_streams(gateway) else {}),
                 etag=_resolve_etag(wf.etag, method),
                 plugin=wf.plugin,
                 # Not enforcement — an ordinary HTTP route's real auth check
