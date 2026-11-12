@@ -47,7 +47,7 @@ from typing import Any
 import arc  # safe at module level — same pattern gateway/request.py already uses;
 
 # arc.codec is stateless and needs no active kernel to be imported
-from . import query
+from . import _maintenance, query
 from ._maintenance import DEFAULT_RETENTION_DAYS as _JOB_LOG_RETENTION_DEFAULT_DAYS
 from .ambient import (
     _CTX_LABEL_REQUEST_ID,
@@ -407,6 +407,22 @@ def register(kernel: Any) -> None:
         "days.",
     )
 
+    kernel.settings.declare(
+        _maintenance.TRASH_RETENTION_KEY,
+        type=int,
+        default=_maintenance.DEFAULT_TRASH_RETENTION_DAYS,
+        doc="How many days ARC keeps the saved copy of a deleted row, table or column (so it can be restored) "
+        "before the nightly clean-up deletes it for good. If not set, 90 days. 0 keeps them all.",
+    )
+    kernel.settings.declare(
+        _maintenance.AUDIT_RETENTION_KEY,
+        type=int,
+        default=_maintenance.DEFAULT_AUDIT_RETENTION_DAYS,
+        doc="How many days ARC keeps the change history (who changed which row, and when) before the nightly "
+        "clean-up deletes older entries. 0, the default, keeps all of it: how long an audit trail must be kept is "
+        "your decision, so nothing is deleted until you set a number.",
+    )
+
     # list()/list_page()'s row cap — see the module-level constants' own
     # docstring for the full split between "default" and "max". Plain
     # settings, not secret: there's nothing sensitive about a row-count
@@ -470,3 +486,6 @@ def register(kernel: Any) -> None:
     from relay._maintenance import prune_job_log
 
     provider.task(queue="default", cron="0 2 * * *")(prune_job_log)
+    # the same, for the tables that only grow (settings trash_retention_days, audit_retention_days)
+    provider.task(queue="default", cron="20 2 * * *")(_maintenance.prune_trash)
+    provider.task(queue="default", cron="30 2 * * *")(_maintenance.prune_audit)
